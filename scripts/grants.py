@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """NonprofitClaw grants domain — 10 actions."""
+import json
 import os
 import sys
 import uuid
@@ -9,6 +10,12 @@ sys.path.insert(0, os.path.expanduser("~/.openclaw/erpclaw/lib"))
 from erpclaw_lib.naming import get_next_name
 from erpclaw_lib.response import ok, err
 from erpclaw_lib.audit import audit
+
+try:
+    from erpclaw_lib.gl_posting import insert_gl_entries
+    HAS_GL = True
+except ImportError:
+    HAS_GL = False
 
 SKILL = "nonprofitclaw"
 
@@ -370,6 +377,8 @@ def approve_grant_expense(conn, args):
 
     amount = _dec(row["amount"])
     grant_id = row["grant_id"]
+    expense_date = row["expense_date"]
+    company_id = row["company_id"]
 
     grant = conn.execute(
         "SELECT remaining_amount FROM nonprofitclaw_grant WHERE id=?", (grant_id,)
@@ -381,12 +390,53 @@ def approve_grant_expense(conn, args):
     if amount > remaining:
         return err(f"Expense amount ({str(amount)}) exceeds grant remaining ({str(remaining)})")
 
+    # GL account IDs (optional — graceful degradation)
+    expense_account_id = getattr(args, "expense_account_id", None)
+    cash_account_id = getattr(args, "cash_account_id", None)
+    cost_center_id = getattr(args, "cost_center_id", None)
+
     # Transaction (implicit)
+    gl_entry_ids = None
     try:
         conn.execute(
             "UPDATE nonprofitclaw_grant_expense SET status='approved' WHERE id=?",
             (expense_id,),
         )
+
+        # --- GL Posting: DR Program Expense, CR Cash/Bank ---
+        if HAS_GL and expense_account_id and cash_account_id:
+            gl_entries = [
+                {
+                    "account_id": expense_account_id,
+                    "debit": str(_round(amount)),
+                    "credit": "0",
+                    "cost_center_id": cost_center_id,
+                },
+                {
+                    "account_id": cash_account_id,
+                    "debit": "0",
+                    "credit": str(_round(amount)),
+                    "cost_center_id": cost_center_id,
+                },
+            ]
+            try:
+                ids = insert_gl_entries(
+                    conn,
+                    gl_entries,
+                    voucher_type="grant_expense",
+                    voucher_id=expense_id,
+                    posting_date=expense_date,
+                    company_id=company_id,
+                    remarks=f"Grant expense {expense_id} for grant {grant_id}",
+                )
+                gl_entry_ids = json.dumps(ids)
+                conn.execute(
+                    "UPDATE nonprofitclaw_grant_expense SET gl_entry_ids=? WHERE id=?",
+                    (gl_entry_ids, expense_id),
+                )
+            except (ValueError, Exception):
+                # GL posting failed — expense approval still proceeds
+                pass
 
         new_spent = str(_round(_dec(
             conn.execute(
@@ -411,14 +461,17 @@ def approve_grant_expense(conn, args):
         conn.rollback()
         return err(f"Approval failed: {e}")
 
-    audit(conn, SKILL, "nonprofit-approve-grant-expense", expense_id, row["company_id"])
-    return ok({
+    audit(conn, SKILL, "nonprofit-approve-grant-expense", expense_id, company_id)
+    result = {
         "id": expense_id,
         "approved": True,
         "amount": str(amount),
         "grant_spent": new_spent,
         "grant_remaining": new_remaining,
-    })
+    }
+    if gl_entry_ids:
+        result["gl_entry_ids"] = json.loads(gl_entry_ids)
+    return ok(result)
 
 
 def grant_status_report(conn, args):

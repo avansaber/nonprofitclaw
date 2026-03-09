@@ -37,7 +37,13 @@ def generate_tax_receipt(conn, args):
     if not donor_id:
         return err("--donor-id is required")
 
-    donor = conn.execute("SELECT id, name, company_id FROM nonprofitclaw_donor WHERE id=?", (donor_id,)).fetchone()
+    donor = conn.execute(
+        """SELECT de.id, c.name, de.company_id
+           FROM nonprofitclaw_donor_ext de
+           JOIN customer c ON de.customer_id = c.id
+           WHERE de.id=?""",
+        (donor_id,),
+    ).fetchone()
     if not donor:
         return err(f"Donor {donor_id} not found")
     if donor["company_id"] != company_id:
@@ -163,11 +169,12 @@ def list_tax_receipts(conn, args):
     ).fetchone()[0]
 
     rows = conn.execute(
-        f"""SELECT tr.id, tr.naming_series, tr.donor_id, d.name as donor_name,
+        f"""SELECT tr.id, tr.naming_series, tr.donor_id, cust.name as donor_name,
                    tr.donation_id, tr.receipt_date, tr.amount, tr.tax_year,
                    tr.receipt_type, tr.sent_date, tr.sent_method
             FROM nonprofitclaw_tax_receipt tr
-            LEFT JOIN nonprofitclaw_donor d ON tr.donor_id = d.id
+            LEFT JOIN nonprofitclaw_donor_ext de ON tr.donor_id = de.id
+            LEFT JOIN customer cust ON de.customer_id = cust.id
             WHERE {where_sql}
             ORDER BY tr.receipt_date DESC LIMIT ? OFFSET ?""",
         params + [limit, offset],
@@ -190,11 +197,11 @@ def donor_summary(conn, args):
     donor_stats = conn.execute(
         """SELECT
             COUNT(*) as total_donors,
-            SUM(CASE WHEN is_active=1 THEN 1 ELSE 0 END) as active_donors,
-            SUM(CASE WHEN donor_type='individual' THEN 1 ELSE 0 END) as individual_donors,
-            SUM(CASE WHEN donor_type='organization' THEN 1 ELSE 0 END) as org_donors,
-            SUM(CASE WHEN donor_type='foundation' THEN 1 ELSE 0 END) as foundation_donors
-           FROM nonprofitclaw_donor WHERE company_id=?""",
+            SUM(CASE WHEN de.is_active=1 THEN 1 ELSE 0 END) as active_donors,
+            SUM(CASE WHEN de.donor_type='individual' THEN 1 ELSE 0 END) as individual_donors,
+            SUM(CASE WHEN de.donor_type='corporate' THEN 1 ELSE 0 END) as org_donors,
+            SUM(CASE WHEN de.donor_type='foundation' THEN 1 ELSE 0 END) as foundation_donors
+           FROM nonprofitclaw_donor_ext de WHERE de.company_id=?""",
         (company_id,),
     ).fetchone()
 
@@ -212,17 +219,18 @@ def donor_summary(conn, args):
     # Donor level breakdown
     level_breakdown = conn.execute(
         """SELECT donor_level, COUNT(*) as count
-           FROM nonprofitclaw_donor WHERE company_id=? AND is_active=1
+           FROM nonprofitclaw_donor_ext WHERE company_id=? AND is_active=1
            GROUP BY donor_level ORDER BY count DESC""",
         (company_id,),
     ).fetchall()
 
     # Top donors
     top_donors = conn.execute(
-        """SELECT id, name, donor_type, total_donated, donation_count, donor_level
-           FROM nonprofitclaw_donor
-           WHERE company_id=? AND is_active=1
-           ORDER BY CAST(total_donated AS REAL) DESC LIMIT 10""",
+        """SELECT de.id, c.name, de.donor_type, de.total_donated, de.donation_count, de.donor_level
+           FROM nonprofitclaw_donor_ext de
+           JOIN customer c ON de.customer_id = c.id
+           WHERE de.company_id=? AND de.is_active=1
+           ORDER BY CAST(de.total_donated AS REAL) DESC LIMIT 10""",
         (company_id,),
     ).fetchall()
 
@@ -272,7 +280,7 @@ def module_status(conn, args):
 
     counts = {}
     tables = [
-        ("donors", "nonprofitclaw_donor"),
+        ("donors", "nonprofitclaw_donor_ext"),
         ("donations", "nonprofitclaw_donation"),
         ("funds", "nonprofitclaw_fund"),
         ("fund_transfers", "nonprofitclaw_fund_transfer"),

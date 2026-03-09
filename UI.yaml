@@ -1,0 +1,131 @@
+ocui_version: "1.0"
+skill: nonprofitclaw
+skill_version: "1.0.0"
+display_name: Non-Profit Management
+icon: heart-handshake
+color: "#9333ea"
+default_entity: donor
+
+domains:
+  - key: donors
+    label: Donors
+    entities: [donor, donation]
+  - key: funds
+    label: Funds
+    entities: [fund, fund_transfer]
+  - key: grants
+    label: Grants
+    entities: [grant, grant_expense]
+  - key: programs
+    label: Programs
+    entities: [program]
+  - key: volunteers
+    label: Volunteers
+    entities: [volunteer, volunteer_shift]
+  - key: campaigns
+    label: Campaigns
+    entities: [campaign, pledge]
+  - key: compliance
+    label: Compliance
+    entities: [tax_receipt]
+
+dashboard:
+  kpis:
+    - key: total_donors
+      label: "Donors"
+      type: count
+      action: nonprofit-list-donors
+      icon: users
+      drill_action: nonprofit-list-donors
+    - key: total_donations
+      label: "Donations"
+      type: count
+      action: nonprofit-list-donations
+      icon: heart
+      drill_action: nonprofit-list-donations
+    - key: active_grants
+      label: "Active Grants"
+      type: count
+      action: nonprofit-list-grants
+      filter: { status: active }
+      severity: success
+      icon: award
+      drill_action: nonprofit-list-grants
+      drill_filter: { status: active }
+    - key: active_campaigns
+      label: "Active Campaigns"
+      type: count
+      action: nonprofit-list-campaigns
+      filter: { status: active }
+      severity: info
+      icon: megaphone
+      drill_action: nonprofit-list-campaigns
+      drill_filter: { status: active }
+    - key: total_volunteers
+      label: "Volunteers"
+      type: count
+      action: nonprofit-list-volunteers
+      icon: hand-helping
+      drill_action: nonprofit-list-volunteers
+  quick_actions:
+    - action: nonprofit-add-donor
+      label: "New Donor"
+      icon: user-plus
+    - action: nonprofit-add-donation
+      label: "Record Donation"
+      icon: heart
+    - action: nonprofit-add-grant
+      label: "New Grant"
+      icon: award
+    - action: nonprofit-add-volunteer
+      label: "New Volunteer"
+      icon: hand-helping
+    - action: nonprofit-add-campaign
+      label: "New Campaign"
+      icon: megaphone
+    - action: nonprofit-add-fund
+      label: "New Fund"
+      icon: piggy-bank
+
+workflows:
+  - after: nonprofit-add-donor
+    suggest:
+      - action: nonprofit-add-donation
+        label: "Record donation"
+        pass: { donor-id: id }
+  - after: nonprofit-add-donation
+    suggest:
+      - action: nonprofit-generate-tax-receipt
+        label: "Generate tax receipt"
+        pass: { donation-id: id }
+  - after: nonprofit-add-grant
+    suggest:
+      - action: nonprofit-activate-grant
+        label: "Activate grant"
+        pass: { grant-id: id }
+      - action: nonprofit-add-grant-expense
+        label: "Record grant expense"
+        pass: { grant-id: id }
+  - after: nonprofit-add-campaign
+    suggest:
+      - action: nonprofit-activate-campaign
+        label: "Activate campaign"
+        pass: { campaign-id: id }
+      - action: nonprofit-add-pledge
+        label: "Record pledge"
+        pass: { campaign-id: id }
+  - after: nonprofit-add-pledge
+    suggest:
+      - action: nonprofit-fulfill-pledge
+        label: "Fulfill pledge"
+        pass: { pledge-id: id }
+  - after: nonprofit-add-volunteer
+    suggest:
+      - action: nonprofit-add-volunteer-shift
+        label: "Schedule volunteer shift"
+        pass: { volunteer-id: id }
+  - after: nonprofit-add-fund
+    suggest:
+      - action: nonprofit-add-fund-transfer
+        label: "Transfer funds"
+        pass: { from-fund-id: id }

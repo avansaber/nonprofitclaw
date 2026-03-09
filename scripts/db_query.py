@@ -24,7 +24,7 @@ from compliance import ACTIONS as COMPLIANCE_ACTIONS
 
 SKILL = "nonprofitclaw"
 DB_PATH = os.path.expanduser("~/.openclaw/erpclaw/data.sqlite")
-REQUIRED_TABLES = ["company", "nonprofitclaw_donor"]
+REQUIRED_TABLES = ["company", "customer", "nonprofitclaw_donor_ext"]
 
 # Merge all domain action dicts
 ACTIONS = {}
@@ -90,7 +90,7 @@ def build_parser():
     parser.add_argument("--zip-code", dest="zip_code", help="ZIP code")
     parser.add_argument("--tax-id", dest="tax_id", help="Tax ID / EIN")
     parser.add_argument("--donor-type", dest="donor_type",
-                        choices=["individual", "organization", "foundation", "government", "anonymous"],
+                        choices=["individual", "corporate", "foundation", "government", "anonymous"],
                         help="Donor type")
     parser.add_argument("--donor-level", dest="donor_level",
                         choices=["standard", "bronze", "silver", "gold", "platinum", "major"],
@@ -173,6 +173,16 @@ def build_parser():
     parser.add_argument("--sent-method", dest="sent_method",
                         choices=["email", "mail", "both"],
                         help="Receipt delivery method")
+
+    # --- GL posting fields (optional — graceful degradation) ---
+    parser.add_argument("--cash-account-id", dest="cash_account_id",
+                        help="Cash/Bank GL account ID for donation receipts or grant disbursements")
+    parser.add_argument("--revenue-account-id", dest="revenue_account_id",
+                        help="Contribution Revenue GL account ID for donation receipts")
+    parser.add_argument("--expense-account-id", dest="expense_account_id",
+                        help="Program Expense GL account ID for grant disbursements")
+    parser.add_argument("--cost-center-id", dest="cost_center_id",
+                        help="Cost center ID for GL postings")
 
     # --- Common filters ---
     parser.add_argument("--notes", help="Notes / comments")

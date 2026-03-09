@@ -28,40 +28,37 @@ def create_nonprofitclaw_tables(db_path):
         -- NonprofitClaw Non-Profit Domain Tables
         -- ==========================================================
 
-        CREATE TABLE IF NOT EXISTS nonprofitclaw_donor (
+        -- Extension table — core donor data lives in customer(id).
+        -- Fields removed (live in core customer): name, email, phone,
+        -- address, city, state, zip_code, tax_id.
+        CREATE TABLE IF NOT EXISTS nonprofitclaw_donor_ext (
             id              TEXT PRIMARY KEY,
-            naming_series   TEXT,
-            donor_type      TEXT NOT NULL DEFAULT 'individual'
-                            CHECK(donor_type IN ('individual','organization','foundation','government','anonymous')),
-            name            TEXT NOT NULL,
-            email           TEXT,
-            phone           TEXT,
-            address         TEXT,
-            city            TEXT,
-            state           TEXT,
-            zip_code        TEXT,
-            tax_id          TEXT,
+            naming_series   TEXT DEFAULT 'NDNR-',
+            customer_id     TEXT NOT NULL REFERENCES customer(id),
+            donor_type      TEXT DEFAULT 'individual'
+                            CHECK(donor_type IN ('individual','corporate','foundation','government','anonymous')),
+            donor_level     TEXT DEFAULT 'standard'
+                            CHECK(donor_level IN ('standard','bronze','silver','gold','platinum','major')),
             first_donation_date TEXT,
             last_donation_date TEXT,
-            total_donated   TEXT NOT NULL DEFAULT '0',
-            donation_count  INTEGER NOT NULL DEFAULT 0,
-            donor_level     TEXT NOT NULL DEFAULT 'standard'
-                            CHECK(donor_level IN ('standard','bronze','silver','gold','platinum','major')),
+            total_donated   TEXT DEFAULT '0',
+            donation_count  INTEGER DEFAULT 0,
             notes           TEXT,
-            is_active       INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
-            company_id      TEXT NOT NULL REFERENCES company(id) ON DELETE RESTRICT,
+            is_active       INTEGER DEFAULT 1,
+            company_id      TEXT NOT NULL REFERENCES company(id),
             created_at      TEXT DEFAULT (datetime('now')),
             updated_at      TEXT DEFAULT (datetime('now'))
         );
 
-        CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_donor_company ON nonprofitclaw_donor(company_id);
-        CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_donor_type ON nonprofitclaw_donor(donor_type);
-        CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_donor_level ON nonprofitclaw_donor(donor_level);
+        CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_donor_ext_company ON nonprofitclaw_donor_ext(company_id);
+        CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_donor_ext_customer ON nonprofitclaw_donor_ext(customer_id);
+        CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_donor_ext_type ON nonprofitclaw_donor_ext(donor_type);
+        CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_donor_ext_level ON nonprofitclaw_donor_ext(donor_level);
 
         CREATE TABLE IF NOT EXISTS nonprofitclaw_donation (
             id              TEXT PRIMARY KEY,
             naming_series   TEXT,
-            donor_id        TEXT NOT NULL REFERENCES nonprofitclaw_donor(id) ON DELETE RESTRICT,
+            donor_id        TEXT NOT NULL REFERENCES nonprofitclaw_donor_ext(id) ON DELETE RESTRICT,
             fund_id         TEXT REFERENCES nonprofitclaw_fund(id) ON DELETE RESTRICT,
             campaign_id     TEXT REFERENCES nonprofitclaw_campaign(id) ON DELETE RESTRICT,
             donation_date   TEXT NOT NULL DEFAULT (date('now')),
@@ -75,6 +72,7 @@ def create_nonprofitclaw_tables(db_path):
             in_kind_fair_value TEXT,
             tax_deductible  INTEGER NOT NULL DEFAULT 1 CHECK(tax_deductible IN (0,1)),
             receipt_sent    INTEGER NOT NULL DEFAULT 0 CHECK(receipt_sent IN (0,1)),
+            gl_entry_ids    TEXT,
             notes           TEXT,
             status          TEXT NOT NULL DEFAULT 'received'
                             CHECK(status IN ('pledged','received','deposited','refunded','cancelled')),
@@ -165,6 +163,7 @@ def create_nonprofitclaw_tables(db_path):
                             CHECK(category IN ('program','personnel','overhead','travel','equipment','supplies','other')),
             description     TEXT,
             receipt_reference TEXT,
+            gl_entry_ids    TEXT,
             status          TEXT NOT NULL DEFAULT 'draft'
                             CHECK(status IN ('draft','submitted','approved','rejected')),
             company_id      TEXT NOT NULL REFERENCES company(id) ON DELETE RESTRICT,
@@ -232,7 +231,7 @@ def create_nonprofitclaw_tables(db_path):
         CREATE TABLE IF NOT EXISTS nonprofitclaw_pledge (
             id              TEXT PRIMARY KEY,
             naming_series   TEXT,
-            donor_id        TEXT NOT NULL REFERENCES nonprofitclaw_donor(id) ON DELETE RESTRICT,
+            donor_id        TEXT NOT NULL REFERENCES nonprofitclaw_donor_ext(id) ON DELETE RESTRICT,
             campaign_id     TEXT REFERENCES nonprofitclaw_campaign(id) ON DELETE RESTRICT,
             fund_id         TEXT REFERENCES nonprofitclaw_fund(id) ON DELETE RESTRICT,
             pledge_date     TEXT NOT NULL DEFAULT (date('now')),
@@ -277,7 +276,7 @@ def create_nonprofitclaw_tables(db_path):
         CREATE TABLE IF NOT EXISTS nonprofitclaw_tax_receipt (
             id              TEXT PRIMARY KEY,
             naming_series   TEXT,
-            donor_id        TEXT NOT NULL REFERENCES nonprofitclaw_donor(id) ON DELETE RESTRICT,
+            donor_id        TEXT NOT NULL REFERENCES nonprofitclaw_donor_ext(id) ON DELETE RESTRICT,
             donation_id     TEXT REFERENCES nonprofitclaw_donation(id) ON DELETE RESTRICT,
             receipt_date    TEXT NOT NULL DEFAULT (date('now')),
             amount          TEXT NOT NULL DEFAULT '0',

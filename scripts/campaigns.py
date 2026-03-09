@@ -273,7 +273,7 @@ def add_pledge(conn, args):
     if not donor_id:
         return err("--donor-id is required")
 
-    donor = conn.execute("SELECT id, company_id FROM nonprofitclaw_donor WHERE id=?", (donor_id,)).fetchone()
+    donor = conn.execute("SELECT id, company_id FROM nonprofitclaw_donor_ext WHERE id=?", (donor_id,)).fetchone()
     if not donor:
         return err(f"Donor {donor_id} not found")
     if donor["company_id"] != company_id:
@@ -358,12 +358,13 @@ def list_pledges(conn, args):
     ).fetchone()[0]
 
     rows = conn.execute(
-        f"""SELECT pl.id, pl.naming_series, pl.donor_id, d.name as donor_name,
+        f"""SELECT pl.id, pl.naming_series, pl.donor_id, cust.name as donor_name,
                    pl.campaign_id, c.name as campaign_name,
                    pl.pledge_date, pl.amount, pl.fulfilled_amount,
                    pl.frequency, pl.next_due_date, pl.status
             FROM nonprofitclaw_pledge pl
-            LEFT JOIN nonprofitclaw_donor d ON pl.donor_id = d.id
+            LEFT JOIN nonprofitclaw_donor_ext de ON pl.donor_id = de.id
+            LEFT JOIN customer cust ON de.customer_id = cust.id
             LEFT JOIN nonprofitclaw_campaign c ON pl.campaign_id = c.id
             WHERE {where_sql}
             ORDER BY pl.pledge_date DESC LIMIT ? OFFSET ?""",
@@ -389,9 +390,10 @@ def get_pledge(conn, args):
         return err("--id is required")
 
     row = conn.execute(
-        """SELECT pl.*, d.name as donor_name, c.name as campaign_name
+        """SELECT pl.*, cust.name as donor_name, c.name as campaign_name
            FROM nonprofitclaw_pledge pl
-           LEFT JOIN nonprofitclaw_donor d ON pl.donor_id = d.id
+           LEFT JOIN nonprofitclaw_donor_ext de ON pl.donor_id = de.id
+           LEFT JOIN customer cust ON de.customer_id = cust.id
            LEFT JOIN nonprofitclaw_campaign c ON pl.campaign_id = c.id
            WHERE pl.id=?""",
         (pledge_id,),
