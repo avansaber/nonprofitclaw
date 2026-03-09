@@ -3,6 +3,7 @@ name: nonprofitclaw
 version: "1.0.0"
 description: "Non-Profit Management — donors, donations, grants, funds, volunteers, campaigns"
 author: "avansaber"
+source: https://github.com/avansaber/nonprofitclaw
 scripts:
   - scripts/db_query.py
 actions:
