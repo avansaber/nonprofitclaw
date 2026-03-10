@@ -122,7 +122,7 @@ def update_donor(conn, args):
     if core_args:
         core_args["--id"] = customer_id
         try:
-            call_skill_action("erpclaw-selling", "update-customer", args=core_args)
+            call_skill_action("erpclaw", "update-customer", args=core_args)
         except CrossSkillError as e:
             return err(f"Failed to update core customer: {e}")
 
