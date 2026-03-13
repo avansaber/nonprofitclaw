@@ -102,7 +102,7 @@ def generate_tax_receipt(conn, args):
         return err(f"Invalid receipt_type: {receipt_type}")
 
     receipt_id = str(uuid.uuid4())
-    naming = get_next_name(conn, "tax_receipt", company_id=company_id)
+    naming = get_next_name(conn, "nonprofitclaw_tax_receipt", company_id=company_id)
 
     conn.execute(
         """INSERT INTO nonprofitclaw_tax_receipt

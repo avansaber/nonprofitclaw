@@ -55,7 +55,7 @@ def add_grant(conn, args):
         return err("Amount must be positive")
 
     grant_id = str(uuid.uuid4())
-    naming = get_next_name(conn, "grant", company_id=company_id)
+    naming = get_next_name(conn, "nonprofitclaw_grant", company_id=company_id)
     grantor_type = getattr(args, "grantor_type", None) or "foundation"
     grant_type = getattr(args, "grant_type", None) or "project"
     reporting_freq = getattr(args, "reporting_freq", None) or "quarterly"
@@ -283,7 +283,7 @@ def add_grant_expense(conn, args):
         return err("Amount must be positive")
 
     expense_id = str(uuid.uuid4())
-    naming = get_next_name(conn, "grant_expense", company_id=company_id)
+    naming = get_next_name(conn, "nonprofitclaw_grant_expense", company_id=company_id)
     category = getattr(args, "category", None) or "program"
 
     conn.execute(

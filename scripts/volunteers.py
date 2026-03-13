@@ -38,7 +38,7 @@ def add_volunteer(conn, args):
         return err("--name is required")
 
     volunteer_id = str(uuid.uuid4())
-    naming = get_next_name(conn, "volunteer", company_id=company_id)
+    naming = get_next_name(conn, "nonprofitclaw_volunteer", company_id=company_id)
 
     conn.execute(
         """INSERT INTO nonprofitclaw_volunteer
@@ -196,7 +196,7 @@ def add_volunteer_shift(conn, args):
             return err(f"Program {program_id} not found")
 
     shift_id = str(uuid.uuid4())
-    naming = get_next_name(conn, "volunteer_shift", company_id=company_id)
+    naming = get_next_name(conn, "nonprofitclaw_volunteer_shift", company_id=company_id)
 
     conn.execute(
         """INSERT INTO nonprofitclaw_volunteer_shift

@@ -37,7 +37,7 @@ def add_program(conn, args):
         return err("--name is required")
 
     program_id = str(uuid.uuid4())
-    naming = get_next_name(conn, "program", company_id=company_id)
+    naming = get_next_name(conn, "nonprofitclaw_program", company_id=company_id)
 
     budget = getattr(args, "budget", None)
     if budget:

@@ -38,7 +38,7 @@ def add_campaign(conn, args):
         return err("--name is required")
 
     campaign_id = str(uuid.uuid4())
-    naming = get_next_name(conn, "campaign", company_id=company_id)
+    naming = get_next_name(conn, "nonprofitclaw_campaign", company_id=company_id)
 
     goal_amount = getattr(args, "goal_amount", None)
     if goal_amount:
@@ -301,7 +301,7 @@ def add_pledge(conn, args):
             return err(f"Fund {fund_id} not found")
 
     pledge_id = str(uuid.uuid4())
-    naming = get_next_name(conn, "pledge", company_id=company_id)
+    naming = get_next_name(conn, "nonprofitclaw_pledge", company_id=company_id)
     frequency = getattr(args, "frequency", None) or "one_time"
 
     conn.execute(

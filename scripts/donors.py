@@ -75,7 +75,7 @@ def add_donor(conn, args):
 
     # 2) Insert extension row
     donor_id = str(uuid.uuid4())
-    naming = get_next_name(conn, "donor", company_id=company_id)
+    naming = get_next_name(conn, "nonprofitclaw_donor_ext", company_id=company_id)
     donor_level = getattr(args, "donor_level", None) or "standard"
 
     conn.execute(
@@ -381,7 +381,7 @@ def add_donation(conn, args):
         return err("Amount must be positive")
 
     donation_id = str(uuid.uuid4())
-    naming = get_next_name(conn, "donation", company_id=company_id)
+    naming = get_next_name(conn, "nonprofitclaw_donation", company_id=company_id)
     donation_date = getattr(args, "donation_date", None) or str(date.today())
     payment_method = getattr(args, "payment_method", None) or "check"
     is_recurring = int(getattr(args, "is_recurring", None) or 0)

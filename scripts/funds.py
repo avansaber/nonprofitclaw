@@ -37,7 +37,7 @@ def add_fund(conn, args):
         return err("--name is required")
 
     fund_id = str(uuid.uuid4())
-    naming = get_next_name(conn, "fund", company_id=company_id)
+    naming = get_next_name(conn, "nonprofitclaw_fund", company_id=company_id)
     fund_type = getattr(args, "fund_type", None) or "unrestricted"
 
     target_amount = getattr(args, "target_amount", None)
@@ -195,7 +195,7 @@ def add_fund_transfer(conn, args):
         return err("Amount must be positive")
 
     transfer_id = str(uuid.uuid4())
-    naming = get_next_name(conn, "fund_transfer", company_id=company_id)
+    naming = get_next_name(conn, "nonprofitclaw_fund_transfer", company_id=company_id)
 
     conn.execute(
         """INSERT INTO nonprofitclaw_fund_transfer
