@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.expanduser("~/.openclaw/erpclaw/lib"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from erpclaw_lib.response import err
+from erpclaw_lib.args import SafeArgumentParser
 
 from donors import ACTIONS as DONORS_ACTIONS
 from funds import ACTIONS as FUNDS_ACTIONS
@@ -58,7 +59,7 @@ def check_tables(conn):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="NonprofitClaw Non-Profit Management")
+    parser = SafeArgumentParser(description="NonprofitClaw Non-Profit Management")
     parser.add_argument("--action", required=True, choices=sorted(ACTIONS.keys()),
                         help="Action to perform")
 
