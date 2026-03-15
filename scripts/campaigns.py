@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.expanduser("~/.openclaw/erpclaw/lib"))
 from erpclaw_lib.naming import get_next_name
 from erpclaw_lib.response import ok, err
 from erpclaw_lib.audit import audit
+from erpclaw_lib.query import Q, P, Table, Field, fn, Order, insert_row, update_row
 
 SKILL = "nonprofitclaw"
 
@@ -48,7 +49,7 @@ def add_campaign(conn, args):
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id:
-        fund = conn.execute("SELECT id FROM nonprofitclaw_fund WHERE id=?", (fund_id,)).fetchone()
+        fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
         if not fund:
             return err(f"Fund {fund_id} not found")
 
@@ -76,7 +77,7 @@ def update_campaign(conn, args):
     if not campaign_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT id, company_id, status FROM nonprofitclaw_campaign WHERE id=?", (campaign_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_campaign")).select(Field("id"), Field("company_id"), Field("status")).where(Field("id") == P()).get_sql(), (campaign_id,)).fetchone()
     if not row:
         return err(f"Campaign {campaign_id} not found")
     if row["status"] in ("completed", "cancelled"):
@@ -101,7 +102,7 @@ def update_campaign(conn, args):
     fund_id = getattr(args, "fund_id", None)
     if fund_id is not None:
         if fund_id:
-            fund = conn.execute("SELECT id FROM nonprofitclaw_fund WHERE id=?", (fund_id,)).fetchone()
+            fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
             if not fund:
                 return err(f"Fund {fund_id} not found")
         fields.append("fund_id=?")
@@ -171,7 +172,7 @@ def get_campaign(conn, args):
     if not campaign_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT * FROM nonprofitclaw_campaign WHERE id=?", (campaign_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_campaign")).select(Table("nonprofitclaw_campaign").star).where(Field("id") == P()).get_sql(), (campaign_id,)).fetchone()
     if not row:
         return err(f"Campaign {campaign_id} not found")
 
@@ -214,7 +215,7 @@ def activate_campaign(conn, args):
     if not campaign_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT id, company_id, status FROM nonprofitclaw_campaign WHERE id=?", (campaign_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_campaign")).select(Field("id"), Field("company_id"), Field("status")).where(Field("id") == P()).get_sql(), (campaign_id,)).fetchone()
     if not row:
         return err(f"Campaign {campaign_id} not found")
     if row["status"] != "draft":
@@ -234,7 +235,7 @@ def close_campaign(conn, args):
     if not campaign_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT * FROM nonprofitclaw_campaign WHERE id=?", (campaign_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_campaign")).select(Table("nonprofitclaw_campaign").star).where(Field("id") == P()).get_sql(), (campaign_id,)).fetchone()
     if not row:
         return err(f"Campaign {campaign_id} not found")
     if row["status"] in ("completed", "cancelled"):
@@ -273,7 +274,7 @@ def add_pledge(conn, args):
     if not donor_id:
         return err("--donor-id is required")
 
-    donor = conn.execute("SELECT id, company_id FROM nonprofitclaw_donor_ext WHERE id=?", (donor_id,)).fetchone()
+    donor = conn.execute(Q.from_(Table("nonprofitclaw_donor_ext")).select(Field("id"), Field("company_id")).where(Field("id") == P()).get_sql(), (donor_id,)).fetchone()
     if not donor:
         return err(f"Donor {donor_id} not found")
     if donor["company_id"] != company_id:
@@ -288,7 +289,7 @@ def add_pledge(conn, args):
 
     campaign_id = getattr(args, "campaign_id", None)
     if campaign_id:
-        campaign = conn.execute("SELECT id, status FROM nonprofitclaw_campaign WHERE id=?", (campaign_id,)).fetchone()
+        campaign = conn.execute(Q.from_(Table("nonprofitclaw_campaign")).select(Field("id"), Field("status")).where(Field("id") == P()).get_sql(), (campaign_id,)).fetchone()
         if not campaign:
             return err(f"Campaign {campaign_id} not found")
         if campaign["status"] != "active":
@@ -296,7 +297,7 @@ def add_pledge(conn, args):
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id:
-        fund = conn.execute("SELECT id FROM nonprofitclaw_fund WHERE id=?", (fund_id,)).fetchone()
+        fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
         if not fund:
             return err(f"Fund {fund_id} not found")
 
@@ -416,7 +417,7 @@ def fulfill_pledge(conn, args):
     if not pledge_id:
         return err("--pledge-id or --id is required")
 
-    row = conn.execute("SELECT * FROM nonprofitclaw_pledge WHERE id=?", (pledge_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_pledge")).select(Table("nonprofitclaw_pledge").star).where(Field("id") == P()).get_sql(), (pledge_id,)).fetchone()
     if not row:
         return err(f"Pledge {pledge_id} not found")
     if row["status"] in ("fulfilled", "cancelled", "lapsed"):
@@ -483,7 +484,7 @@ def cancel_pledge(conn, args):
     if not pledge_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT id, company_id, status FROM nonprofitclaw_pledge WHERE id=?", (pledge_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_pledge")).select(Field("id"), Field("company_id"), Field("status")).where(Field("id") == P()).get_sql(), (pledge_id,)).fetchone()
     if not row:
         return err(f"Pledge {pledge_id} not found")
     if row["status"] in ("fulfilled", "cancelled"):

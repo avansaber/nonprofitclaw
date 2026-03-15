@@ -13,6 +13,7 @@ from erpclaw_lib.audit import audit
 
 try:
     from erpclaw_lib.gl_posting import insert_gl_entries
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Order, insert_row, update_row
     HAS_GL = True
 except ImportError:
     HAS_GL = False
@@ -62,7 +63,7 @@ def add_grant(conn, args):
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id:
-        fund = conn.execute("SELECT id FROM nonprofitclaw_fund WHERE id=?", (fund_id,)).fetchone()
+        fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
         if not fund:
             return err(f"Fund {fund_id} not found")
 
@@ -93,7 +94,7 @@ def update_grant(conn, args):
     if not grant_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT id, company_id, status FROM nonprofitclaw_grant WHERE id=?", (grant_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_grant")).select(Field("id"), Field("company_id"), Field("status")).where(Field("id") == P()).get_sql(), (grant_id,)).fetchone()
     if not row:
         return err(f"Grant {grant_id} not found")
     if row["status"] in ("closed", "rejected"):
@@ -116,7 +117,7 @@ def update_grant(conn, args):
     fund_id = getattr(args, "fund_id", None)
     if fund_id is not None:
         if fund_id:
-            fund = conn.execute("SELECT id FROM nonprofitclaw_fund WHERE id=?", (fund_id,)).fetchone()
+            fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
             if not fund:
                 return err(f"Fund {fund_id} not found")
         fields.append("fund_id=?")
@@ -188,7 +189,7 @@ def get_grant(conn, args):
     if not grant_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT * FROM nonprofitclaw_grant WHERE id=?", (grant_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_grant")).select(Table("nonprofitclaw_grant").star).where(Field("id") == P()).get_sql(), (grant_id,)).fetchone()
     if not row:
         return err(f"Grant {grant_id} not found")
 
@@ -213,7 +214,7 @@ def activate_grant(conn, args):
     if not grant_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT * FROM nonprofitclaw_grant WHERE id=?", (grant_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_grant")).select(Table("nonprofitclaw_grant").star).where(Field("id") == P()).get_sql(), (grant_id,)).fetchone()
     if not row:
         return err(f"Grant {grant_id} not found")
     if row["status"] not in ("applied", "awarded"):
@@ -367,9 +368,7 @@ def approve_grant_expense(conn, args):
     if not expense_id:
         return err("--id is required")
 
-    row = conn.execute(
-        "SELECT * FROM nonprofitclaw_grant_expense WHERE id=?", (expense_id,)
-    ).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_grant_expense")).select(Table("nonprofitclaw_grant_expense").star).where(Field("id") == P()).get_sql(), (expense_id,)).fetchone()
     if not row:
         return err(f"Grant expense {expense_id} not found")
     if row["status"] != "draft" and row["status"] != "submitted":
@@ -380,9 +379,7 @@ def approve_grant_expense(conn, args):
     expense_date = row["expense_date"]
     company_id = row["company_id"]
 
-    grant = conn.execute(
-        "SELECT remaining_amount FROM nonprofitclaw_grant WHERE id=?", (grant_id,)
-    ).fetchone()
+    grant = conn.execute(Q.from_(Table("nonprofitclaw_grant")).select(Field("remaining_amount")).where(Field("id") == P()).get_sql(), (grant_id,)).fetchone()
     if not grant:
         return err(f"Grant {grant_id} not found")
 
@@ -445,7 +442,7 @@ def approve_grant_expense(conn, args):
             ).fetchone()[0]
         )))
 
-        grant_full = conn.execute("SELECT amount FROM nonprofitclaw_grant WHERE id=?", (grant_id,)).fetchone()
+        grant_full = conn.execute(Q.from_(Table("nonprofitclaw_grant")).select(Field("amount")).where(Field("id") == P()).get_sql(), (grant_id,)).fetchone()
         new_remaining = str(_round(_dec(grant_full["amount"]) - _dec(new_spent)))
 
         conn.execute(
@@ -519,7 +516,7 @@ def close_grant(conn, args):
     if not grant_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT * FROM nonprofitclaw_grant WHERE id=?", (grant_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_grant")).select(Table("nonprofitclaw_grant").star).where(Field("id") == P()).get_sql(), (grant_id,)).fetchone()
     if not row:
         return err(f"Grant {grant_id} not found")
     if row["status"] in ("closed", "rejected"):

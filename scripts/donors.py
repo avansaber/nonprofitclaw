@@ -22,6 +22,7 @@ from erpclaw_lib.cross_skill import create_customer, call_skill_action, CrossSki
 
 try:
     from erpclaw_lib.gl_posting import insert_gl_entries, reverse_gl_entries
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Order, insert_row, update_row
     HAS_GL = True
 except ImportError:
     HAS_GL = False
@@ -274,12 +275,8 @@ def merge_donors(conn, args):
     if source_id == target_id:
         return err("Source and target donor must be different")
 
-    source = conn.execute(
-        "SELECT id, customer_id, company_id FROM nonprofitclaw_donor_ext WHERE id=?", (source_id,)
-    ).fetchone()
-    target = conn.execute(
-        "SELECT id, customer_id, company_id FROM nonprofitclaw_donor_ext WHERE id=?", (target_id,)
-    ).fetchone()
+    source = conn.execute(Q.from_(Table("nonprofitclaw_donor_ext")).select(Field("id"), Field("customer_id"), Field("company_id")).where(Field("id") == P()).get_sql(), (source_id,)).fetchone()
+    target = conn.execute(Q.from_(Table("nonprofitclaw_donor_ext")).select(Field("id"), Field("customer_id"), Field("company_id")).where(Field("id") == P()).get_sql(), (target_id,)).fetchone()
     if not source:
         return err(f"Source donor {source_id} not found")
     if not target:
@@ -389,13 +386,13 @@ def add_donation(conn, args):
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id:
-        fund = conn.execute("SELECT id FROM nonprofitclaw_fund WHERE id=?", (fund_id,)).fetchone()
+        fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
         if not fund:
             return err(f"Fund {fund_id} not found")
 
     campaign_id = getattr(args, "campaign_id", None)
     if campaign_id:
-        campaign = conn.execute("SELECT id FROM nonprofitclaw_campaign WHERE id=?", (campaign_id,)).fetchone()
+        campaign = conn.execute(Q.from_(Table("nonprofitclaw_campaign")).select(Field("id")).where(Field("id") == P()).get_sql(), (campaign_id,)).fetchone()
         if not campaign:
             return err(f"Campaign {campaign_id} not found")
 
@@ -530,7 +527,7 @@ def update_donation(conn, args):
     if not donation_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT * FROM nonprofitclaw_donation WHERE id=?", (donation_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_donation")).select(Table("nonprofitclaw_donation").star).where(Field("id") == P()).get_sql(), (donation_id,)).fetchone()
     if not row:
         return err(f"Donation {donation_id} not found")
     if row["status"] in ("refunded", "cancelled"):
@@ -655,7 +652,7 @@ def refund_donation(conn, args):
     if not donation_id:
         return err("--donation-id or --id is required")
 
-    row = conn.execute("SELECT * FROM nonprofitclaw_donation WHERE id=?", (donation_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_donation")).select(Table("nonprofitclaw_donation").star).where(Field("id") == P()).get_sql(), (donation_id,)).fetchone()
     if not row:
         return err(f"Donation {donation_id} not found")
     if row["status"] == "refunded":

@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.expanduser("~/.openclaw/erpclaw/lib"))
 from erpclaw_lib.naming import get_next_name
 from erpclaw_lib.response import ok, err
 from erpclaw_lib.audit import audit
+from erpclaw_lib.query import Q, P, Table, Field, fn, Order, insert_row, update_row
 
 SKILL = "nonprofitclaw"
 
@@ -47,7 +48,7 @@ def add_program(conn, args):
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id:
-        fund = conn.execute("SELECT id FROM nonprofitclaw_fund WHERE id=?", (fund_id,)).fetchone()
+        fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
         if not fund:
             return err(f"Fund {fund_id} not found")
 
@@ -78,7 +79,7 @@ def update_program(conn, args):
     if not program_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT id, company_id FROM nonprofitclaw_program WHERE id=?", (program_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_program")).select(Field("id"), Field("company_id")).where(Field("id") == P()).get_sql(), (program_id,)).fetchone()
     if not row:
         return err(f"Program {program_id} not found")
 
@@ -102,7 +103,7 @@ def update_program(conn, args):
     fund_id = getattr(args, "fund_id", None)
     if fund_id is not None:
         if fund_id:
-            fund = conn.execute("SELECT id FROM nonprofitclaw_fund WHERE id=?", (fund_id,)).fetchone()
+            fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
             if not fund:
                 return err(f"Fund {fund_id} not found")
         fields.append("fund_id=?")
@@ -212,7 +213,7 @@ def update_program_outcomes(conn, args):
     if not program_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT id, company_id FROM nonprofitclaw_program WHERE id=?", (program_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_program")).select(Field("id"), Field("company_id")).where(Field("id") == P()).get_sql(), (program_id,)).fetchone()
     if not row:
         return err(f"Program {program_id} not found")
 

@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.expanduser("~/.openclaw/erpclaw/lib"))
 from erpclaw_lib.naming import get_next_name
 from erpclaw_lib.response import ok, err
 from erpclaw_lib.audit import audit
+from erpclaw_lib.query import Q, P, Table, Field, fn, Order, insert_row, update_row
 
 SKILL = "nonprofitclaw"
 
@@ -68,7 +69,7 @@ def update_fund(conn, args):
     if not fund_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT id, company_id FROM nonprofitclaw_fund WHERE id=?", (fund_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id"), Field("company_id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
     if not row:
         return err(f"Fund {fund_id} not found")
 
@@ -155,7 +156,7 @@ def get_fund(conn, args):
     if not fund_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT * FROM nonprofitclaw_fund WHERE id=?", (fund_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Table("nonprofitclaw_fund").star).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
     if not row:
         return err(f"Fund {fund_id} not found")
 
@@ -178,8 +179,8 @@ def add_fund_transfer(conn, args):
     if from_fund_id == to_fund_id:
         return err("Source and destination fund must be different")
 
-    from_fund = conn.execute("SELECT id, company_id, current_balance FROM nonprofitclaw_fund WHERE id=?", (from_fund_id,)).fetchone()
-    to_fund = conn.execute("SELECT id, company_id FROM nonprofitclaw_fund WHERE id=?", (to_fund_id,)).fetchone()
+    from_fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id"), Field("company_id"), Field("current_balance")).where(Field("id") == P()).get_sql(), (from_fund_id,)).fetchone()
+    to_fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id"), Field("company_id")).where(Field("id") == P()).get_sql(), (to_fund_id,)).fetchone()
     if not from_fund:
         return err(f"Source fund {from_fund_id} not found")
     if not to_fund:
@@ -263,7 +264,7 @@ def approve_fund_transfer(conn, args):
     if not transfer_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT * FROM nonprofitclaw_fund_transfer WHERE id=?", (transfer_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_fund_transfer")).select(Table("nonprofitclaw_fund_transfer").star).where(Field("id") == P()).get_sql(), (transfer_id,)).fetchone()
     if not row:
         return err(f"Fund transfer {transfer_id} not found")
     if row["status"] != "draft":
@@ -274,7 +275,7 @@ def approve_fund_transfer(conn, args):
     to_fund_id = row["to_fund_id"]
 
     # Check source fund has sufficient balance
-    from_fund = conn.execute("SELECT current_balance FROM nonprofitclaw_fund WHERE id=?", (from_fund_id,)).fetchone()
+    from_fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("current_balance")).where(Field("id") == P()).get_sql(), (from_fund_id,)).fetchone()
     if _dec(from_fund["current_balance"]) < amount:
         return err(f"Insufficient balance in source fund. Available: {from_fund['current_balance']}, Required: {str(amount)}")
 

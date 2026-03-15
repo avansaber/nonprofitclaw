@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.expanduser("~/.openclaw/erpclaw/lib"))
 from erpclaw_lib.naming import get_next_name
 from erpclaw_lib.response import ok, err
 from erpclaw_lib.audit import audit
+from erpclaw_lib.query import Q, P, Table, Field, fn, Order, insert_row, update_row
 
 SKILL = "nonprofitclaw"
 
@@ -65,7 +66,7 @@ def update_volunteer(conn, args):
     if not volunteer_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT id, company_id FROM nonprofitclaw_volunteer WHERE id=?", (volunteer_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_volunteer")).select(Field("id"), Field("company_id")).where(Field("id") == P()).get_sql(), (volunteer_id,)).fetchone()
     if not row:
         return err(f"Volunteer {volunteer_id} not found")
 
@@ -142,7 +143,7 @@ def get_volunteer(conn, args):
     if not volunteer_id:
         return err("--id is required")
 
-    row = conn.execute("SELECT * FROM nonprofitclaw_volunteer WHERE id=?", (volunteer_id,)).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_volunteer")).select(Table("nonprofitclaw_volunteer").star).where(Field("id") == P()).get_sql(), (volunteer_id,)).fetchone()
     if not row:
         return err(f"Volunteer {volunteer_id} not found")
 
@@ -174,9 +175,7 @@ def add_volunteer_shift(conn, args):
     if not volunteer_id:
         return err("--volunteer-id is required")
 
-    volunteer = conn.execute(
-        "SELECT id, company_id FROM nonprofitclaw_volunteer WHERE id=?", (volunteer_id,)
-    ).fetchone()
+    volunteer = conn.execute(Q.from_(Table("nonprofitclaw_volunteer")).select(Field("id"), Field("company_id")).where(Field("id") == P()).get_sql(), (volunteer_id,)).fetchone()
     if not volunteer:
         return err(f"Volunteer {volunteer_id} not found")
     if volunteer["company_id"] != company_id:
@@ -191,7 +190,7 @@ def add_volunteer_shift(conn, args):
 
     program_id = getattr(args, "program_id", None)
     if program_id:
-        program = conn.execute("SELECT id FROM nonprofitclaw_program WHERE id=?", (program_id,)).fetchone()
+        program = conn.execute(Q.from_(Table("nonprofitclaw_program")).select(Field("id")).where(Field("id") == P()).get_sql(), (program_id,)).fetchone()
         if not program:
             return err(f"Program {program_id} not found")
 
@@ -279,9 +278,7 @@ def complete_volunteer_shift(conn, args):
     if not shift_id:
         return err("--id is required")
 
-    row = conn.execute(
-        "SELECT * FROM nonprofitclaw_volunteer_shift WHERE id=?", (shift_id,)
-    ).fetchone()
+    row = conn.execute(Q.from_(Table("nonprofitclaw_volunteer_shift")).select(Table("nonprofitclaw_volunteer_shift").star).where(Field("id") == P()).get_sql(), (shift_id,)).fetchone()
     if not row:
         return err(f"Volunteer shift {shift_id} not found")
     if row["status"] == "completed":

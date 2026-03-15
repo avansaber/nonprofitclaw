@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.expanduser("~/.openclaw/erpclaw/lib"))
 from erpclaw_lib.naming import get_next_name
 from erpclaw_lib.response import ok, err
 from erpclaw_lib.audit import audit
+from erpclaw_lib.query import Q, P, Table, Field, fn, Order, insert_row, update_row
 
 SKILL = "nonprofitclaw"
 
@@ -76,9 +77,7 @@ def generate_tax_receipt(conn, args):
         amount = donation["amount"]
 
         # Check for duplicate receipt
-        existing = conn.execute(
-            "SELECT id FROM nonprofitclaw_tax_receipt WHERE donation_id=?", (donation_id,)
-        ).fetchone()
+        existing = conn.execute(Q.from_(Table("nonprofitclaw_tax_receipt")).select(Field("id")).where(Field("donation_id") == P()).get_sql(), (donation_id,)).fetchone()
         if existing:
             return err(f"Tax receipt already exists for this donation: {existing['id']}")
 
