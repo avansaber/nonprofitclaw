@@ -22,12 +22,24 @@ from erpclaw_lib.cross_skill import create_customer, call_skill_action, CrossSki
 
 try:
     from erpclaw_lib.gl_posting import insert_gl_entries, reverse_gl_entries
-    from erpclaw_lib.query import Q, P, Table, Field, fn, Order, insert_row, update_row
+    from erpclaw_lib.query import (
+        Q, P, Table, Field, fn, Order, LiteralValue,
+        insert_row, update_row, dynamic_update,
+    )
     HAS_GL = True
 except ImportError:
     HAS_GL = False
 
 SKILL = "nonprofitclaw"
+
+# ── Table aliases ──
+_de = Table("nonprofitclaw_donor_ext")
+_c = Table("customer")
+_don = Table("nonprofitclaw_donation")
+_fund = Table("nonprofitclaw_fund")
+_campaign = Table("nonprofitclaw_campaign")
+_pledge = Table("nonprofitclaw_pledge")
+_receipt = Table("nonprofitclaw_tax_receipt")
 
 
 def _dec(val):
@@ -79,18 +91,16 @@ def add_donor(conn, args):
     naming = get_next_name(conn, "nonprofitclaw_donor_ext", company_id=company_id)
     donor_level = getattr(args, "donor_level", None) or "standard"
 
-    conn.execute(
-        """INSERT INTO nonprofitclaw_donor_ext
-           (id, naming_series, customer_id, donor_type, donor_level,
-            notes, is_active, company_id)
-           VALUES (?,?,?,?,?,?,?,?)""",
-        (
-            donor_id, naming, customer_id, donor_type,
-            donor_level,
-            getattr(args, "notes", None),
-            1, company_id,
-        ),
-    )
+    sql, _ = insert_row("nonprofitclaw_donor_ext", {
+        "id": P(), "naming_series": P(), "customer_id": P(), "donor_type": P(),
+        "donor_level": P(), "notes": P(), "is_active": P(), "company_id": P(),
+    })
+    conn.execute(sql, (
+        donor_id, naming, customer_id, donor_type,
+        donor_level,
+        getattr(args, "notes", None),
+        1, company_id,
+    ))
     conn.commit()
     audit(conn, SKILL, "nonprofit-add-donor", donor_id, company_id)
     return ok({"id": donor_id, "customer_id": customer_id, "naming_series": naming, "name": name})
@@ -101,10 +111,8 @@ def update_donor(conn, args):
     if not donor_id:
         return err("--id is required")
 
-    row = conn.execute(
-        "SELECT de.id, de.customer_id, de.company_id FROM nonprofitclaw_donor_ext de WHERE de.id=?",
-        (donor_id,),
-    ).fetchone()
+    q = Q.from_(_de).select(_de.id, _de.customer_id, _de.company_id).where(_de.id == P())
+    row = conn.execute(q.get_sql(), (donor_id,)).fetchone()
     if not row:
         return err(f"Donor {donor_id} not found")
 
@@ -128,29 +136,26 @@ def update_donor(conn, args):
             return err(f"Failed to update core customer: {e}")
 
     # --- Extension fields ---
-    ext_fields = []
-    ext_values = []
+    ext_data = {}
     for col, attr in [
         ("donor_type", "donor_type"), ("donor_level", "donor_level"),
         ("notes", "notes"),
     ]:
         val = getattr(args, attr, None)
         if val is not None:
-            ext_fields.append(f"{col}=?")
-            ext_values.append(val)
+            ext_data[col] = val
 
     is_active = getattr(args, "is_active", None)
     if is_active is not None:
-        ext_fields.append("is_active=?")
-        ext_values.append(int(is_active))
+        ext_data["is_active"] = int(is_active)
 
-    if ext_fields:
-        ext_fields.append("updated_at=datetime('now')")
-        ext_values.append(donor_id)
-        conn.execute(f"UPDATE nonprofitclaw_donor_ext SET {', '.join(ext_fields)} WHERE id=?", ext_values)
+    if ext_data:
+        ext_data["updated_at"] = LiteralValue("datetime('now')")
+        sql, params = dynamic_update("nonprofitclaw_donor_ext", ext_data, where={"id": donor_id})
+        conn.execute(sql, params)
         conn.commit()
 
-    if not core_args and not ext_fields:
+    if not core_args and not ext_data:
         return err("No fields to update")
 
     audit(conn, SKILL, "nonprofit-update-donor", donor_id, row["company_id"])
@@ -165,47 +170,47 @@ def list_donors(conn, args):
     limit = int(getattr(args, "limit", None) or 50)
     offset = int(getattr(args, "offset", None) or 0)
 
-    where = ["de.company_id=?"]
+    base = Q.from_(_de).join(_c).on(_de.customer_id == _c.id)
+    conditions = [_de.company_id == P()]
     params = [company_id]
 
     search = getattr(args, "search", None)
     if search:
-        where.append("(c.name LIKE ? OR c.primary_contact LIKE ?)")
+        conditions.append(_c.name.like(P()) | _c.primary_contact.like(P()))
         params.extend([f"%{search}%", f"%{search}%"])
 
     donor_type = getattr(args, "donor_type", None)
     if donor_type:
-        where.append("de.donor_type=?")
+        conditions.append(_de.donor_type == P())
         params.append(donor_type)
 
     donor_level = getattr(args, "donor_level", None)
     if donor_level:
-        where.append("de.donor_level=?")
+        conditions.append(_de.donor_level == P())
         params.append(donor_level)
 
     is_active = getattr(args, "is_active", None)
     if is_active is not None:
-        where.append("de.is_active=?")
+        conditions.append(_de.is_active == P())
         params.append(int(is_active))
 
-    where_sql = " AND ".join(where)
+    # Count query
+    count_q = base.select(fn.Count("*"))
+    for cond in conditions:
+        count_q = count_q.where(cond)
+    total = conn.execute(count_q.get_sql(), params).fetchone()[0]
 
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM nonprofitclaw_donor_ext de JOIN customer c ON de.customer_id = c.id WHERE {where_sql}",
-        params,
-    ).fetchone()[0]
+    # Data query
+    data_q = base.select(
+        _de.id, _de.naming_series, _de.customer_id, _de.donor_type,
+        _c.name, _c.primary_contact.as_("email"), _c.tax_id,
+        _de.total_donated, _de.donation_count, _de.donor_level, _de.is_active,
+    )
+    for cond in conditions:
+        data_q = data_q.where(cond)
+    data_q = data_q.orderby(_de.created_at, order=Order.desc).limit(P()).offset(P())
 
-    rows = conn.execute(
-        f"""SELECT de.id, de.naming_series, de.customer_id, de.donor_type,
-                   c.name, c.primary_contact AS email, c.tax_id,
-                   de.total_donated, de.donation_count, de.donor_level, de.is_active
-            FROM nonprofitclaw_donor_ext de
-            JOIN customer c ON de.customer_id = c.id
-            WHERE {where_sql}
-            ORDER BY de.created_at DESC LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
-
+    rows = conn.execute(data_q.get_sql(), params + [limit, offset]).fetchall()
     donors = [dict(r) for r in rows]
     return ok({"donors": donors, "total": total})
 
@@ -215,14 +220,16 @@ def get_donor(conn, args):
     if not donor_id:
         return err("--id is required")
 
-    row = conn.execute(
-        """SELECT de.*, c.name, c.primary_contact AS email,
-                  c.primary_address AS address, c.tax_id
-           FROM nonprofitclaw_donor_ext de
-           JOIN customer c ON de.customer_id = c.id
-           WHERE de.id=?""",
-        (donor_id,),
-    ).fetchone()
+    q = (
+        Q.from_(_de)
+        .join(_c).on(_de.customer_id == _c.id)
+        .select(
+            _de.star, _c.name, _c.primary_contact.as_("email"),
+            _c.primary_address.as_("address"), _c.tax_id,
+        )
+        .where(_de.id == P())
+    )
+    row = conn.execute(q.get_sql(), (donor_id,)).fetchone()
     if not row:
         return err(f"Donor {donor_id} not found")
 
@@ -234,28 +241,34 @@ def donor_giving_history(conn, args):
     if not donor_id:
         return err("--donor-id is required")
 
-    row = conn.execute(
-        """SELECT de.id, c.name
-           FROM nonprofitclaw_donor_ext de
-           JOIN customer c ON de.customer_id = c.id
-           WHERE de.id=?""",
-        (donor_id,),
-    ).fetchone()
+    q = (
+        Q.from_(_de)
+        .join(_c).on(_de.customer_id == _c.id)
+        .select(_de.id, _c.name)
+        .where(_de.id == P())
+    )
+    row = conn.execute(q.get_sql(), (donor_id,)).fetchone()
     if not row:
         return err(f"Donor {donor_id} not found")
 
-    donations = conn.execute(
-        """SELECT id, naming_series, donation_date, amount, payment_method,
-                  fund_id, campaign_id, status, reference
-           FROM nonprofitclaw_donation WHERE donor_id=?
-           ORDER BY donation_date DESC""",
-        (donor_id,),
-    ).fetchall()
+    don_q = (
+        Q.from_(_don)
+        .select(
+            _don.id, _don.naming_series, _don.donation_date, _don.amount,
+            _don.payment_method, _don.fund_id, _don.campaign_id, _don.status, _don.reference,
+        )
+        .where(_don.donor_id == P())
+        .orderby(_don.donation_date, order=Order.desc)
+    )
+    donations = conn.execute(don_q.get_sql(), (donor_id,)).fetchall()
 
-    total_row = conn.execute(
-        "SELECT SUM(CAST(amount AS REAL)) FROM nonprofitclaw_donation WHERE donor_id=? AND status NOT IN ('refunded','cancelled')",
-        (donor_id,),
-    ).fetchone()
+    total_q = (
+        Q.from_(_don)
+        .select(LiteralValue("SUM(CAST(amount AS REAL))"))
+        .where(_don.donor_id == P())
+        .where(_don.status.notin(["refunded", "cancelled"]))
+    )
+    total_row = conn.execute(total_q.get_sql(), (donor_id,)).fetchone()
     total = str(_round(_dec(total_row[0]))) if total_row[0] else "0.00"
 
     return ok({
@@ -275,8 +288,9 @@ def merge_donors(conn, args):
     if source_id == target_id:
         return err("Source and target donor must be different")
 
-    source = conn.execute(Q.from_(Table("nonprofitclaw_donor_ext")).select(Field("id"), Field("customer_id"), Field("company_id")).where(Field("id") == P()).get_sql(), (source_id,)).fetchone()
-    target = conn.execute(Q.from_(Table("nonprofitclaw_donor_ext")).select(Field("id"), Field("customer_id"), Field("company_id")).where(Field("id") == P()).get_sql(), (target_id,)).fetchone()
+    sq = Q.from_(_de).select(_de.id, _de.customer_id, _de.company_id).where(_de.id == P())
+    source = conn.execute(sq.get_sql(), (source_id,)).fetchone()
+    target = conn.execute(sq.get_sql(), (target_id,)).fetchone()
     if not source:
         return err(f"Source donor {source_id} not found")
     if not target:
@@ -287,43 +301,55 @@ def merge_donors(conn, args):
     # Transaction (implicit)
     try:
         # Move donations, pledges, tax receipts to target ext record
-        conn.execute("UPDATE nonprofitclaw_donation SET donor_id=? WHERE donor_id=?", (target_id, source_id))
-        conn.execute("UPDATE nonprofitclaw_pledge SET donor_id=? WHERE donor_id=?", (target_id, source_id))
-        conn.execute("UPDATE nonprofitclaw_tax_receipt SET donor_id=? WHERE donor_id=?", (target_id, source_id))
+        upd1_sql, upd1_p = dynamic_update("nonprofitclaw_donation", {"donor_id": target_id}, where={"donor_id": source_id})
+        conn.execute(upd1_sql, upd1_p)
+        upd2_sql, upd2_p = dynamic_update("nonprofitclaw_pledge", {"donor_id": target_id}, where={"donor_id": source_id})
+        conn.execute(upd2_sql, upd2_p)
+        upd3_sql, upd3_p = dynamic_update("nonprofitclaw_tax_receipt", {"donor_id": target_id}, where={"donor_id": source_id})
+        conn.execute(upd3_sql, upd3_p)
 
         # Recalculate target donor stats
-        stats = conn.execute(
-            """SELECT COUNT(*) as cnt,
-                      SUM(CAST(amount AS REAL)) as total
-               FROM nonprofitclaw_donation
-               WHERE donor_id=? AND status NOT IN ('refunded','cancelled')""",
-            (target_id,),
-        ).fetchone()
+        stats_q = (
+            Q.from_(_don)
+            .select(fn.Count("*").as_("cnt"), LiteralValue("SUM(CAST(amount AS REAL))").as_("total"))
+            .where(_don.donor_id == P())
+            .where(_don.status.notin(["refunded", "cancelled"]))
+        )
+        stats = conn.execute(stats_q.get_sql(), (target_id,)).fetchone()
 
-        last_date = conn.execute(
-            "SELECT MAX(donation_date) FROM nonprofitclaw_donation WHERE donor_id=? AND status NOT IN ('refunded','cancelled')",
-            (target_id,),
-        ).fetchone()
+        last_q = (
+            Q.from_(_don)
+            .select(fn.Max(_don.donation_date))
+            .where(_don.donor_id == P())
+            .where(_don.status.notin(["refunded", "cancelled"]))
+        )
+        last_date = conn.execute(last_q.get_sql(), (target_id,)).fetchone()
 
-        first_date = conn.execute(
-            "SELECT MIN(donation_date) FROM nonprofitclaw_donation WHERE donor_id=? AND status NOT IN ('refunded','cancelled')",
-            (target_id,),
-        ).fetchone()
+        first_q = (
+            Q.from_(_don)
+            .select(fn.Min(_don.donation_date))
+            .where(_don.donor_id == P())
+            .where(_don.status.notin(["refunded", "cancelled"]))
+        )
+        first_date = conn.execute(first_q.get_sql(), (target_id,)).fetchone()
 
         new_total = str(_round(_dec(stats["total"]))) if stats["total"] else "0"
         new_count = stats["cnt"] or 0
 
-        conn.execute(
-            """UPDATE nonprofitclaw_donor_ext SET
-                total_donated=?, donation_count=?,
-                last_donation_date=?, first_donation_date=?,
-                updated_at=datetime('now')
-               WHERE id=?""",
-            (new_total, new_count, last_date[0], first_date[0], target_id),
-        )
+        upd_target = {
+            "total_donated": new_total,
+            "donation_count": new_count,
+            "last_donation_date": last_date[0],
+            "first_donation_date": first_date[0],
+            "updated_at": LiteralValue("datetime('now')"),
+        }
+        sql_t, params_t = dynamic_update("nonprofitclaw_donor_ext", upd_target, where={"id": target_id})
+        conn.execute(sql_t, params_t)
 
         # Delete source ext record (core customer record remains for audit trail)
-        conn.execute("DELETE FROM nonprofitclaw_donor_ext WHERE id=?", (source_id,))
+        t = Table("nonprofitclaw_donor_ext")
+        del_q = Q.from_(t).delete().where(t.id == P())
+        conn.execute(del_q.get_sql(), (source_id,))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -361,10 +387,8 @@ def add_donation(conn, args):
     if not donor_id:
         return err("--donor-id is required")
 
-    donor = conn.execute(
-        "SELECT id, customer_id, company_id FROM nonprofitclaw_donor_ext WHERE id=?",
-        (donor_id,),
-    ).fetchone()
+    dq = Q.from_(_de).select(_de.id, _de.customer_id, _de.company_id).where(_de.id == P())
+    donor = conn.execute(dq.get_sql(), (donor_id,)).fetchone()
     if not donor:
         return err(f"Donor {donor_id} not found")
     if donor["company_id"] != company_id:
@@ -386,14 +410,14 @@ def add_donation(conn, args):
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id:
-        fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
-        if not fund:
+        fq = Q.from_(_fund).select(_fund.id).where(_fund.id == P())
+        if not conn.execute(fq.get_sql(), (fund_id,)).fetchone():
             return err(f"Fund {fund_id} not found")
 
     campaign_id = getattr(args, "campaign_id", None)
     if campaign_id:
-        campaign = conn.execute(Q.from_(Table("nonprofitclaw_campaign")).select(Field("id")).where(Field("id") == P()).get_sql(), (campaign_id,)).fetchone()
-        if not campaign:
+        cq = Q.from_(_campaign).select(_campaign.id).where(_campaign.id == P())
+        if not conn.execute(cq.get_sql(), (campaign_id,)).fetchone():
             return err(f"Campaign {campaign_id} not found")
 
     # GL account IDs (optional — graceful degradation)
@@ -404,21 +428,20 @@ def add_donation(conn, args):
     # Transaction (implicit)
     gl_entry_ids = None
     try:
-        conn.execute(
-            """INSERT INTO nonprofitclaw_donation
-               (id, naming_series, donor_id, fund_id, campaign_id,
-                donation_date, amount, payment_method, reference,
-                is_recurring, recurrence_freq, notes, status, company_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                donation_id, naming, donor_id, fund_id, campaign_id,
-                donation_date, str(amount), payment_method,
-                getattr(args, "reference", None),
-                is_recurring, recurrence_freq,
-                getattr(args, "notes", None),
-                "received", company_id,
-            ),
-        )
+        sql, _ = insert_row("nonprofitclaw_donation", {
+            "id": P(), "naming_series": P(), "donor_id": P(), "fund_id": P(),
+            "campaign_id": P(), "donation_date": P(), "amount": P(),
+            "payment_method": P(), "reference": P(), "is_recurring": P(),
+            "recurrence_freq": P(), "notes": P(), "status": P(), "company_id": P(),
+        })
+        conn.execute(sql, (
+            donation_id, naming, donor_id, fund_id, campaign_id,
+            donation_date, str(amount), payment_method,
+            getattr(args, "reference", None),
+            is_recurring, recurrence_freq,
+            getattr(args, "notes", None),
+            "received", company_id,
+        ))
 
         # --- GL Posting: DR Cash/Bank, CR Contribution Revenue ---
         if HAS_GL and cash_account_id and revenue_account_id:
@@ -450,65 +473,74 @@ def add_donation(conn, args):
                     remarks=f"Donation {naming} from donor {donor_id}",
                 )
                 gl_entry_ids = json.dumps(ids)
-                conn.execute(
-                    "UPDATE nonprofitclaw_donation SET gl_entry_ids=? WHERE id=?",
-                    (gl_entry_ids, donation_id),
-                )
+                sql_gl, params_gl = dynamic_update("nonprofitclaw_donation",
+                    {"gl_entry_ids": gl_entry_ids}, where={"id": donation_id})
+                conn.execute(sql_gl, params_gl)
             except (ValueError, Exception):
                 # GL posting failed — donation still recorded, no GL entries
-                # This is intentional graceful degradation: the donation data
-                # is preserved even when GL accounts aren't properly configured.
                 pass
 
         # Update donor ext stats
-        stats = conn.execute(
-            """SELECT COUNT(*) as cnt,
-                      SUM(CAST(amount AS REAL)) as total
-               FROM nonprofitclaw_donation
-               WHERE donor_id=? AND status NOT IN ('refunded','cancelled')""",
-            (donor_id,),
-        ).fetchone()
+        stats_q = (
+            Q.from_(_don)
+            .select(fn.Count("*").as_("cnt"), LiteralValue("SUM(CAST(amount AS REAL))").as_("total"))
+            .where(_don.donor_id == P())
+            .where(_don.status.notin(["refunded", "cancelled"]))
+        )
+        stats = conn.execute(stats_q.get_sql(), (donor_id,)).fetchone()
 
         new_total = str(_round(_dec(stats["total"]))) if stats["total"] else "0"
         new_count = stats["cnt"] or 0
 
-        first_date = conn.execute(
-            "SELECT MIN(donation_date) FROM nonprofitclaw_donation WHERE donor_id=? AND status NOT IN ('refunded','cancelled')",
-            (donor_id,),
-        ).fetchone()
-
-        conn.execute(
-            """UPDATE nonprofitclaw_donor_ext SET
-                total_donated=?, donation_count=?,
-                last_donation_date=?, first_donation_date=COALESCE(first_donation_date, ?),
-                updated_at=datetime('now')
-               WHERE id=?""",
-            (new_total, new_count, donation_date, first_date[0], donor_id),
+        first_q = (
+            Q.from_(_don)
+            .select(fn.Min(_don.donation_date))
+            .where(_don.donor_id == P())
+            .where(_don.status.notin(["refunded", "cancelled"]))
         )
+        first_date = conn.execute(first_q.get_sql(), (donor_id,)).fetchone()
+
+        upd_donor = {
+            "total_donated": new_total,
+            "donation_count": new_count,
+            "last_donation_date": donation_date,
+            "updated_at": LiteralValue("datetime('now')"),
+        }
+        # Use COALESCE for first_donation_date to preserve existing value
+        t = Table("nonprofitclaw_donor_ext")
+        upd_q = (
+            Q.update(t)
+            .set(t.total_donated, P())
+            .set(t.donation_count, P())
+            .set(t.last_donation_date, P())
+            .set(t.first_donation_date, LiteralValue("COALESCE(first_donation_date, ?)"))
+            .set(t.updated_at, LiteralValue("datetime('now')"))
+            .where(t.id == P())
+        )
+        conn.execute(upd_q.get_sql(), (new_total, new_count, donation_date, first_date[0], donor_id))
 
         # Update fund balance if applicable
         if fund_id:
-            conn.execute(
-                """UPDATE nonprofitclaw_fund SET
-                    current_balance = CAST(
-                        CAST(current_balance AS REAL) + ? AS TEXT
-                    ), updated_at=datetime('now')
-                   WHERE id=?""",
-                (float(amount), fund_id),
+            ft = Table("nonprofitclaw_fund")
+            fund_upd = (
+                Q.update(ft)
+                .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS REAL) + ? AS TEXT)"))
+                .set(ft.updated_at, LiteralValue("datetime('now')"))
+                .where(ft.id == P())
             )
+            conn.execute(fund_upd.get_sql(), (float(amount), fund_id))
 
         # Update campaign raised_amount if applicable
         if campaign_id:
-            conn.execute(
-                """UPDATE nonprofitclaw_campaign SET
-                    raised_amount = CAST(
-                        CAST(raised_amount AS REAL) + ? AS TEXT
-                    ),
-                    donor_count = donor_count + 1,
-                    updated_at=datetime('now')
-                   WHERE id=?""",
-                (float(amount), campaign_id),
+            ct = Table("nonprofitclaw_campaign")
+            camp_upd = (
+                Q.update(ct)
+                .set(ct.raised_amount, LiteralValue("CAST(CAST(raised_amount AS REAL) + ? AS TEXT)"))
+                .set(ct.donor_count, LiteralValue("donor_count + 1"))
+                .set(ct.updated_at, LiteralValue("datetime('now')"))
+                .where(ct.id == P())
             )
+            conn.execute(camp_upd.get_sql(), (float(amount), campaign_id))
 
         conn.commit()
     except Exception as e:
@@ -527,39 +559,36 @@ def update_donation(conn, args):
     if not donation_id:
         return err("--id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_donation")).select(Table("nonprofitclaw_donation").star).where(Field("id") == P()).get_sql(), (donation_id,)).fetchone()
+    q = Q.from_(_don).select(_don.star).where(_don.id == P())
+    row = conn.execute(q.get_sql(), (donation_id,)).fetchone()
     if not row:
         return err(f"Donation {donation_id} not found")
     if row["status"] in ("refunded", "cancelled"):
         return err(f"Cannot update donation in '{row['status']}' status")
 
-    fields = []
-    values = []
+    data = {}
     for col, attr in [
         ("payment_method", "payment_method"), ("reference", "reference"),
         ("notes", "notes"), ("donation_date", "donation_date"),
     ]:
         val = getattr(args, attr, None)
         if val is not None:
-            fields.append(f"{col}=?")
-            values.append(val)
+            data[col] = val
 
     is_recurring = getattr(args, "is_recurring", None)
     if is_recurring is not None:
-        fields.append("is_recurring=?")
-        values.append(int(is_recurring))
+        data["is_recurring"] = int(is_recurring)
 
     recurrence_freq = getattr(args, "recurrence_freq", None)
     if recurrence_freq is not None:
-        fields.append("recurrence_freq=?")
-        values.append(recurrence_freq)
+        data["recurrence_freq"] = recurrence_freq
 
-    if not fields:
+    if not data:
         return err("No fields to update")
 
-    fields.append("updated_at=datetime('now')")
-    values.append(donation_id)
-    conn.execute(f"UPDATE nonprofitclaw_donation SET {', '.join(fields)} WHERE id=?", values)
+    data["updated_at"] = LiteralValue("datetime('now')")
+    sql, params = dynamic_update("nonprofitclaw_donation", data, where={"id": donation_id})
+    conn.execute(sql, params)
     conn.commit()
     audit(conn, SKILL, "nonprofit-update-donation", donation_id, row["company_id"])
     return ok({"id": donation_id, "updated": True})
@@ -573,57 +602,64 @@ def list_donations(conn, args):
     limit = int(getattr(args, "limit", None) or 50)
     offset = int(getattr(args, "offset", None) or 0)
 
-    where = ["d.company_id=?"]
+    d = _don
+    de = _de
+    c = _c
+
+    # Count query (simple, no joins needed)
+    conditions = [d.company_id == P()]
     params = [company_id]
 
     donor_id = getattr(args, "donor_id", None)
     if donor_id:
-        where.append("d.donor_id=?")
+        conditions.append(d.donor_id == P())
         params.append(donor_id)
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id:
-        where.append("d.fund_id=?")
+        conditions.append(d.fund_id == P())
         params.append(fund_id)
 
     campaign_id = getattr(args, "campaign_id", None)
     if campaign_id:
-        where.append("d.campaign_id=?")
+        conditions.append(d.campaign_id == P())
         params.append(campaign_id)
 
     status = getattr(args, "status", None)
     if status:
-        where.append("d.status=?")
+        conditions.append(d.status == P())
         params.append(status)
 
     from_date = getattr(args, "from_date", None)
     if from_date:
-        where.append("d.donation_date >= ?")
+        conditions.append(d.donation_date >= P())
         params.append(from_date)
 
     to_date = getattr(args, "to_date", None)
     if to_date:
-        where.append("d.donation_date <= ?")
+        conditions.append(d.donation_date <= P())
         params.append(to_date)
 
-    where_sql = " AND ".join(where)
+    count_q = Q.from_(d).select(fn.Count("*"))
+    for cond in conditions:
+        count_q = count_q.where(cond)
+    total = conn.execute(count_q.get_sql(), params).fetchone()[0]
 
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM nonprofitclaw_donation d WHERE {where_sql}", params
-    ).fetchone()[0]
+    data_q = (
+        Q.from_(d)
+        .left_join(de).on(d.donor_id == de.id)
+        .left_join(c).on(de.customer_id == c.id)
+        .select(
+            d.id, d.naming_series, d.donor_id, c.name.as_("donor_name"),
+            d.donation_date, d.amount, d.payment_method, d.status,
+            d.fund_id, d.campaign_id, d.is_recurring,
+        )
+    )
+    for cond in conditions:
+        data_q = data_q.where(cond)
+    data_q = data_q.orderby(d.donation_date, order=Order.desc).limit(P()).offset(P())
 
-    rows = conn.execute(
-        f"""SELECT d.id, d.naming_series, d.donor_id, c.name as donor_name,
-                   d.donation_date, d.amount, d.payment_method, d.status,
-                   d.fund_id, d.campaign_id, d.is_recurring
-            FROM nonprofitclaw_donation d
-            LEFT JOIN nonprofitclaw_donor_ext de ON d.donor_id = de.id
-            LEFT JOIN customer c ON de.customer_id = c.id
-            WHERE {where_sql}
-            ORDER BY d.donation_date DESC LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
-
+    rows = conn.execute(data_q.get_sql(), params + [limit, offset]).fetchall()
     donations = [dict(r) for r in rows]
     return ok({"donations": donations, "total": total})
 
@@ -633,14 +669,14 @@ def get_donation(conn, args):
     if not donation_id:
         return err("--id is required")
 
-    row = conn.execute(
-        """SELECT d.*, c.name as donor_name
-           FROM nonprofitclaw_donation d
-           LEFT JOIN nonprofitclaw_donor_ext de ON d.donor_id = de.id
-           LEFT JOIN customer c ON de.customer_id = c.id
-           WHERE d.id=?""",
-        (donation_id,),
-    ).fetchone()
+    q = (
+        Q.from_(_don)
+        .left_join(_de).on(_don.donor_id == _de.id)
+        .left_join(_c).on(_de.customer_id == _c.id)
+        .select(_don.star, _c.name.as_("donor_name"))
+        .where(_don.id == P())
+    )
+    row = conn.execute(q.get_sql(), (donation_id,)).fetchone()
     if not row:
         return err(f"Donation {donation_id} not found")
 
@@ -652,7 +688,8 @@ def refund_donation(conn, args):
     if not donation_id:
         return err("--donation-id or --id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_donation")).select(Table("nonprofitclaw_donation").star).where(Field("id") == P()).get_sql(), (donation_id,)).fetchone()
+    q = Q.from_(_don).select(_don.star).where(_don.id == P())
+    row = conn.execute(q.get_sql(), (donation_id,)).fetchone()
     if not row:
         return err(f"Donation {donation_id} not found")
     if row["status"] == "refunded":
@@ -669,10 +706,10 @@ def refund_donation(conn, args):
     # Transaction (implicit)
     gl_reversal_ids = None
     try:
-        conn.execute(
-            "UPDATE nonprofitclaw_donation SET status='refunded', updated_at=datetime('now') WHERE id=?",
-            (donation_id,),
-        )
+        sql_ref, params_ref = dynamic_update("nonprofitclaw_donation",
+            {"status": "refunded", "updated_at": LiteralValue("datetime('now')")},
+            where={"id": donation_id})
+        conn.execute(sql_ref, params_ref)
 
         # --- Reverse GL entries if they exist ---
         if HAS_GL and row["gl_entry_ids"]:
@@ -689,54 +726,56 @@ def refund_donation(conn, args):
                 pass
 
         # Update donor stats
-        stats = conn.execute(
-            """SELECT COUNT(*) as cnt,
-                      SUM(CAST(amount AS REAL)) as total
-               FROM nonprofitclaw_donation
-               WHERE donor_id=? AND status NOT IN ('refunded','cancelled')""",
-            (donor_id,),
-        ).fetchone()
+        stats_q = (
+            Q.from_(_don)
+            .select(fn.Count("*").as_("cnt"), LiteralValue("SUM(CAST(amount AS REAL))").as_("total"))
+            .where(_don.donor_id == P())
+            .where(_don.status.notin(["refunded", "cancelled"]))
+        )
+        stats = conn.execute(stats_q.get_sql(), (donor_id,)).fetchone()
 
         new_total = str(_round(_dec(stats["total"]))) if stats["total"] else "0"
         new_count = stats["cnt"] or 0
 
-        last_date = conn.execute(
-            "SELECT MAX(donation_date) FROM nonprofitclaw_donation WHERE donor_id=? AND status NOT IN ('refunded','cancelled')",
-            (donor_id,),
-        ).fetchone()
-
-        conn.execute(
-            """UPDATE nonprofitclaw_donor_ext SET
-                total_donated=?, donation_count=?,
-                last_donation_date=?,
-                updated_at=datetime('now')
-               WHERE id=?""",
-            (new_total, new_count, last_date[0], donor_id),
+        last_q = (
+            Q.from_(_don)
+            .select(fn.Max(_don.donation_date))
+            .where(_don.donor_id == P())
+            .where(_don.status.notin(["refunded", "cancelled"]))
         )
+        last_date = conn.execute(last_q.get_sql(), (donor_id,)).fetchone()
+
+        upd_donor = {
+            "total_donated": new_total,
+            "donation_count": new_count,
+            "last_donation_date": last_date[0],
+            "updated_at": LiteralValue("datetime('now')"),
+        }
+        sql_d, params_d = dynamic_update("nonprofitclaw_donor_ext", upd_donor, where={"id": donor_id})
+        conn.execute(sql_d, params_d)
 
         # Reverse fund balance if applicable
         if fund_id:
-            conn.execute(
-                """UPDATE nonprofitclaw_fund SET
-                    current_balance = CAST(
-                        CAST(current_balance AS REAL) - ? AS TEXT
-                    ), updated_at=datetime('now')
-                   WHERE id=?""",
-                (float(amount), fund_id),
+            ft = Table("nonprofitclaw_fund")
+            fund_upd = (
+                Q.update(ft)
+                .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS REAL) - ? AS TEXT)"))
+                .set(ft.updated_at, LiteralValue("datetime('now')"))
+                .where(ft.id == P())
             )
+            conn.execute(fund_upd.get_sql(), (float(amount), fund_id))
 
         # Reverse campaign stats if applicable
         if campaign_id:
-            conn.execute(
-                """UPDATE nonprofitclaw_campaign SET
-                    raised_amount = CAST(
-                        CAST(raised_amount AS REAL) - ? AS TEXT
-                    ),
-                    donor_count = MAX(donor_count - 1, 0),
-                    updated_at=datetime('now')
-                   WHERE id=?""",
-                (float(amount), campaign_id),
+            ct = Table("nonprofitclaw_campaign")
+            camp_upd = (
+                Q.update(ct)
+                .set(ct.raised_amount, LiteralValue("CAST(CAST(raised_amount AS REAL) - ? AS TEXT)"))
+                .set(ct.donor_count, LiteralValue("MAX(donor_count - 1, 0)"))
+                .set(ct.updated_at, LiteralValue("datetime('now')"))
+                .where(ct.id == P())
             )
+            conn.execute(camp_upd.get_sql(), (float(amount), campaign_id))
 
         conn.commit()
     except Exception as e:

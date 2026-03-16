@@ -10,9 +10,20 @@ sys.path.insert(0, os.path.expanduser("~/.openclaw/erpclaw/lib"))
 from erpclaw_lib.naming import get_next_name
 from erpclaw_lib.response import ok, err
 from erpclaw_lib.audit import audit
-from erpclaw_lib.query import Q, P, Table, Field, fn, Order, insert_row, update_row
+from erpclaw_lib.query import (
+    Q, P, Table, Field, fn, Order, LiteralValue,
+    insert_row, update_row, dynamic_update,
+)
 
 SKILL = "nonprofitclaw"
+
+# ── Table aliases ──
+_campaign = Table("nonprofitclaw_campaign")
+_pledge = Table("nonprofitclaw_pledge")
+_de = Table("nonprofitclaw_donor_ext")
+_c = Table("customer")
+_fund = Table("nonprofitclaw_fund")
+_don = Table("nonprofitclaw_donation")
 
 
 def _dec(val):
@@ -49,24 +60,23 @@ def add_campaign(conn, args):
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id:
-        fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
-        if not fund:
+        fq = Q.from_(_fund).select(_fund.id).where(_fund.id == P())
+        if not conn.execute(fq.get_sql(), (fund_id,)).fetchone():
             return err(f"Fund {fund_id} not found")
 
-    conn.execute(
-        """INSERT INTO nonprofitclaw_campaign
-           (id, naming_series, name, description, fund_id, goal_amount,
-            start_date, end_date, status, company_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
-        (
-            campaign_id, naming, name,
-            getattr(args, "description", None),
-            fund_id, goal_amount,
-            getattr(args, "start_date", None),
-            getattr(args, "end_date", None),
-            "draft", company_id,
-        ),
-    )
+    sql, _ = insert_row("nonprofitclaw_campaign", {
+        "id": P(), "naming_series": P(), "name": P(), "description": P(),
+        "fund_id": P(), "goal_amount": P(), "start_date": P(),
+        "end_date": P(), "status": P(), "company_id": P(),
+    })
+    conn.execute(sql, (
+        campaign_id, naming, name,
+        getattr(args, "description", None),
+        fund_id, goal_amount,
+        getattr(args, "start_date", None),
+        getattr(args, "end_date", None),
+        "draft", company_id,
+    ))
     conn.commit()
     audit(conn, SKILL, "nonprofit-add-campaign", campaign_id, company_id)
     return ok({"id": campaign_id, "naming_series": naming, "name": name})
@@ -77,43 +87,40 @@ def update_campaign(conn, args):
     if not campaign_id:
         return err("--id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_campaign")).select(Field("id"), Field("company_id"), Field("status")).where(Field("id") == P()).get_sql(), (campaign_id,)).fetchone()
+    q = Q.from_(_campaign).select(_campaign.id, _campaign.company_id, _campaign.status).where(_campaign.id == P())
+    row = conn.execute(q.get_sql(), (campaign_id,)).fetchone()
     if not row:
         return err(f"Campaign {campaign_id} not found")
     if row["status"] in ("completed", "cancelled"):
         return err(f"Cannot update campaign in '{row['status']}' status")
 
-    fields = []
-    values = []
+    data = {}
     for col, attr in [
         ("name", "name"), ("description", "description"),
         ("start_date", "start_date"), ("end_date", "end_date"),
     ]:
         val = getattr(args, attr, None)
         if val is not None:
-            fields.append(f"{col}=?")
-            values.append(val)
+            data[col] = val
 
     goal_amount = getattr(args, "goal_amount", None)
     if goal_amount is not None:
-        fields.append("goal_amount=?")
-        values.append(str(_round(_dec(goal_amount))))
+        data["goal_amount"] = str(_round(_dec(goal_amount)))
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id is not None:
         if fund_id:
-            fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
-            if not fund:
+            fq = Q.from_(_fund).select(_fund.id).where(_fund.id == P())
+            if not conn.execute(fq.get_sql(), (fund_id,)).fetchone():
                 return err(f"Fund {fund_id} not found")
-        fields.append("fund_id=?")
-        values.append(fund_id if fund_id else None)
+        data["fund_id"] = fund_id if fund_id else None
 
-    if not fields:
+    if not data:
         return err("No fields to update")
 
-    fields.append("updated_at=datetime('now')")
-    values.append(campaign_id)
-    conn.execute(f"UPDATE nonprofitclaw_campaign SET {', '.join(fields)} WHERE id=?", values)
+    data["updated_at"] = LiteralValue("datetime('now')")
+    sql, params = dynamic_update("nonprofitclaw_campaign", data, where={"id": campaign_id})
+    conn.execute(sql, params)
     conn.commit()
     audit(conn, SKILL, "nonprofit-update-campaign", campaign_id, row["company_id"])
     return ok({"id": campaign_id, "updated": True})
@@ -127,33 +134,34 @@ def list_campaigns(conn, args):
     limit = int(getattr(args, "limit", None) or 50)
     offset = int(getattr(args, "offset", None) or 0)
 
-    where = ["company_id=?"]
+    conditions = [_campaign.company_id == P()]
     params = [company_id]
 
     status = getattr(args, "status", None)
     if status:
-        where.append("status=?")
+        conditions.append(_campaign.status == P())
         params.append(status)
 
     search = getattr(args, "search", None)
     if search:
-        where.append("name LIKE ?")
+        conditions.append(_campaign.name.like(P()))
         params.append(f"%{search}%")
 
-    where_sql = " AND ".join(where)
+    count_q = Q.from_(_campaign).select(fn.Count("*"))
+    for cond in conditions:
+        count_q = count_q.where(cond)
+    total = conn.execute(count_q.get_sql(), params).fetchone()[0]
 
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM nonprofitclaw_campaign WHERE {where_sql}", params
-    ).fetchone()[0]
+    data_q = Q.from_(_campaign).select(
+        _campaign.id, _campaign.naming_series, _campaign.name, _campaign.description,
+        _campaign.fund_id, _campaign.goal_amount, _campaign.raised_amount,
+        _campaign.donor_count, _campaign.start_date, _campaign.end_date, _campaign.status,
+    )
+    for cond in conditions:
+        data_q = data_q.where(cond)
+    data_q = data_q.orderby(_campaign.created_at, order=Order.desc).limit(P()).offset(P())
 
-    rows = conn.execute(
-        f"""SELECT id, naming_series, name, description, fund_id,
-                   goal_amount, raised_amount, donor_count,
-                   start_date, end_date, status
-            FROM nonprofitclaw_campaign WHERE {where_sql}
-            ORDER BY created_at DESC LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
+    rows = conn.execute(data_q.get_sql(), params + [limit, offset]).fetchall()
 
     campaigns = []
     for r in rows:
@@ -172,28 +180,35 @@ def get_campaign(conn, args):
     if not campaign_id:
         return err("--id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_campaign")).select(Table("nonprofitclaw_campaign").star).where(Field("id") == P()).get_sql(), (campaign_id,)).fetchone()
+    q = Q.from_(_campaign).select(_campaign.star).where(_campaign.id == P())
+    row = conn.execute(q.get_sql(), (campaign_id,)).fetchone()
     if not row:
         return err(f"Campaign {campaign_id} not found")
 
     # Get pledge summary
-    pledge_stats = conn.execute(
-        """SELECT COUNT(*) as pledge_count,
-                  SUM(CAST(amount AS REAL)) as pledged_total,
-                  SUM(CAST(fulfilled_amount AS REAL)) as fulfilled_total
-           FROM nonprofitclaw_pledge
-           WHERE campaign_id=? AND status != 'cancelled'""",
-        (campaign_id,),
-    ).fetchone()
+    pledge_q = (
+        Q.from_(_pledge)
+        .select(
+            fn.Count("*").as_("pledge_count"),
+            LiteralValue("SUM(CAST(amount AS REAL))").as_("pledged_total"),
+            LiteralValue("SUM(CAST(fulfilled_amount AS REAL))").as_("fulfilled_total"),
+        )
+        .where(_pledge.campaign_id == P())
+        .where(_pledge.status != "cancelled")
+    )
+    pledge_stats = conn.execute(pledge_q.get_sql(), (campaign_id,)).fetchone()
 
     # Get donation summary
-    donation_stats = conn.execute(
-        """SELECT COUNT(*) as donation_count,
-                  SUM(CAST(amount AS REAL)) as donation_total
-           FROM nonprofitclaw_donation
-           WHERE campaign_id=? AND status NOT IN ('refunded','cancelled')""",
-        (campaign_id,),
-    ).fetchone()
+    don_q = (
+        Q.from_(_don)
+        .select(
+            fn.Count("*").as_("donation_count"),
+            LiteralValue("SUM(CAST(amount AS REAL))").as_("donation_total"),
+        )
+        .where(_don.campaign_id == P())
+        .where(_don.status.notin(["refunded", "cancelled"]))
+    )
+    donation_stats = conn.execute(don_q.get_sql(), (campaign_id,)).fetchone()
 
     campaign_data = dict(row)
     campaign_data["pledge_count"] = pledge_stats["pledge_count"] or 0
@@ -215,16 +230,17 @@ def activate_campaign(conn, args):
     if not campaign_id:
         return err("--id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_campaign")).select(Field("id"), Field("company_id"), Field("status")).where(Field("id") == P()).get_sql(), (campaign_id,)).fetchone()
+    q = Q.from_(_campaign).select(_campaign.id, _campaign.company_id, _campaign.status).where(_campaign.id == P())
+    row = conn.execute(q.get_sql(), (campaign_id,)).fetchone()
     if not row:
         return err(f"Campaign {campaign_id} not found")
     if row["status"] != "draft":
         return err(f"Campaign must be in 'draft' status to activate, currently '{row['status']}'")
 
-    conn.execute(
-        "UPDATE nonprofitclaw_campaign SET status='active', updated_at=datetime('now') WHERE id=?",
-        (campaign_id,),
-    )
+    sql, params = dynamic_update("nonprofitclaw_campaign",
+        {"status": "active", "updated_at": LiteralValue("datetime('now')")},
+        where={"id": campaign_id})
+    conn.execute(sql, params)
     conn.commit()
     audit(conn, SKILL, "nonprofit-activate-campaign", campaign_id, row["company_id"])
     return ok({"id": campaign_id, "campaign_status": "active"})
@@ -235,22 +251,23 @@ def close_campaign(conn, args):
     if not campaign_id:
         return err("--id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_campaign")).select(Table("nonprofitclaw_campaign").star).where(Field("id") == P()).get_sql(), (campaign_id,)).fetchone()
+    q = Q.from_(_campaign).select(_campaign.star).where(_campaign.id == P())
+    row = conn.execute(q.get_sql(), (campaign_id,)).fetchone()
     if not row:
         return err(f"Campaign {campaign_id} not found")
     if row["status"] in ("completed", "cancelled"):
         return err(f"Campaign is already '{row['status']}'")
 
     # Lapse active pledges
-    conn.execute(
-        "UPDATE nonprofitclaw_pledge SET status='lapsed', updated_at=datetime('now') WHERE campaign_id=? AND status='active'",
-        (campaign_id,),
-    )
+    sql_lapse, params_lapse = dynamic_update("nonprofitclaw_pledge",
+        {"status": "lapsed", "updated_at": LiteralValue("datetime('now')")},
+        where={"campaign_id": campaign_id, "status": "active"})
+    conn.execute(sql_lapse, params_lapse)
 
-    conn.execute(
-        "UPDATE nonprofitclaw_campaign SET status='completed', updated_at=datetime('now') WHERE id=?",
-        (campaign_id,),
-    )
+    sql_c, params_c = dynamic_update("nonprofitclaw_campaign",
+        {"status": "completed", "updated_at": LiteralValue("datetime('now')")},
+        where={"id": campaign_id})
+    conn.execute(sql_c, params_c)
     conn.commit()
     audit(conn, SKILL, "nonprofit-close-campaign", campaign_id, row["company_id"])
     return ok({
@@ -274,7 +291,8 @@ def add_pledge(conn, args):
     if not donor_id:
         return err("--donor-id is required")
 
-    donor = conn.execute(Q.from_(Table("nonprofitclaw_donor_ext")).select(Field("id"), Field("company_id")).where(Field("id") == P()).get_sql(), (donor_id,)).fetchone()
+    dq = Q.from_(_de).select(_de.id, _de.company_id).where(_de.id == P())
+    donor = conn.execute(dq.get_sql(), (donor_id,)).fetchone()
     if not donor:
         return err(f"Donor {donor_id} not found")
     if donor["company_id"] != company_id:
@@ -289,7 +307,8 @@ def add_pledge(conn, args):
 
     campaign_id = getattr(args, "campaign_id", None)
     if campaign_id:
-        campaign = conn.execute(Q.from_(Table("nonprofitclaw_campaign")).select(Field("id"), Field("status")).where(Field("id") == P()).get_sql(), (campaign_id,)).fetchone()
+        cq = Q.from_(_campaign).select(_campaign.id, _campaign.status).where(_campaign.id == P())
+        campaign = conn.execute(cq.get_sql(), (campaign_id,)).fetchone()
         if not campaign:
             return err(f"Campaign {campaign_id} not found")
         if campaign["status"] != "active":
@@ -297,30 +316,29 @@ def add_pledge(conn, args):
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id:
-        fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
-        if not fund:
+        fq = Q.from_(_fund).select(_fund.id).where(_fund.id == P())
+        if not conn.execute(fq.get_sql(), (fund_id,)).fetchone():
             return err(f"Fund {fund_id} not found")
 
     pledge_id = str(uuid.uuid4())
     naming = get_next_name(conn, "nonprofitclaw_pledge", company_id=company_id)
     frequency = getattr(args, "frequency", None) or "one_time"
 
-    conn.execute(
-        """INSERT INTO nonprofitclaw_pledge
-           (id, naming_series, donor_id, campaign_id, fund_id,
-            pledge_date, amount, frequency, next_due_date,
-            end_date, notes, status, company_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            pledge_id, naming, donor_id, campaign_id, fund_id,
-            getattr(args, "pledge_date", None) or str(date.today()),
-            str(amount), frequency,
-            getattr(args, "next_due_date", None),
-            getattr(args, "end_date", None),
-            getattr(args, "notes", None),
-            "active", company_id,
-        ),
-    )
+    sql, _ = insert_row("nonprofitclaw_pledge", {
+        "id": P(), "naming_series": P(), "donor_id": P(), "campaign_id": P(),
+        "fund_id": P(), "pledge_date": P(), "amount": P(), "frequency": P(),
+        "next_due_date": P(), "end_date": P(), "notes": P(), "status": P(),
+        "company_id": P(),
+    })
+    conn.execute(sql, (
+        pledge_id, naming, donor_id, campaign_id, fund_id,
+        getattr(args, "pledge_date", None) or str(date.today()),
+        str(amount), frequency,
+        getattr(args, "next_due_date", None),
+        getattr(args, "end_date", None),
+        getattr(args, "notes", None),
+        "active", company_id,
+    ))
     conn.commit()
     audit(conn, SKILL, "nonprofit-add-pledge", pledge_id, company_id)
     return ok({"id": pledge_id, "naming_series": naming, "amount": str(amount)})
@@ -334,43 +352,51 @@ def list_pledges(conn, args):
     limit = int(getattr(args, "limit", None) or 50)
     offset = int(getattr(args, "offset", None) or 0)
 
-    where = ["pl.company_id=?"]
+    pl = _pledge
+    de = _de
+    cust = _c
+    camp = _campaign
+
+    conditions = [pl.company_id == P()]
     params = [company_id]
 
     donor_id = getattr(args, "donor_id", None)
     if donor_id:
-        where.append("pl.donor_id=?")
+        conditions.append(pl.donor_id == P())
         params.append(donor_id)
 
     campaign_id = getattr(args, "campaign_id", None)
     if campaign_id:
-        where.append("pl.campaign_id=?")
+        conditions.append(pl.campaign_id == P())
         params.append(campaign_id)
 
     status = getattr(args, "status", None)
     if status:
-        where.append("pl.status=?")
+        conditions.append(pl.status == P())
         params.append(status)
 
-    where_sql = " AND ".join(where)
+    count_q = Q.from_(pl).select(fn.Count("*"))
+    for cond in conditions:
+        count_q = count_q.where(cond)
+    total = conn.execute(count_q.get_sql(), params).fetchone()[0]
 
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM nonprofitclaw_pledge pl WHERE {where_sql}", params
-    ).fetchone()[0]
+    data_q = (
+        Q.from_(pl)
+        .left_join(de).on(pl.donor_id == de.id)
+        .left_join(cust).on(de.customer_id == cust.id)
+        .left_join(camp).on(pl.campaign_id == camp.id)
+        .select(
+            pl.id, pl.naming_series, pl.donor_id, cust.name.as_("donor_name"),
+            pl.campaign_id, camp.name.as_("campaign_name"),
+            pl.pledge_date, pl.amount, pl.fulfilled_amount,
+            pl.frequency, pl.next_due_date, pl.status,
+        )
+    )
+    for cond in conditions:
+        data_q = data_q.where(cond)
+    data_q = data_q.orderby(pl.pledge_date, order=Order.desc).limit(P()).offset(P())
 
-    rows = conn.execute(
-        f"""SELECT pl.id, pl.naming_series, pl.donor_id, cust.name as donor_name,
-                   pl.campaign_id, c.name as campaign_name,
-                   pl.pledge_date, pl.amount, pl.fulfilled_amount,
-                   pl.frequency, pl.next_due_date, pl.status
-            FROM nonprofitclaw_pledge pl
-            LEFT JOIN nonprofitclaw_donor_ext de ON pl.donor_id = de.id
-            LEFT JOIN customer cust ON de.customer_id = cust.id
-            LEFT JOIN nonprofitclaw_campaign c ON pl.campaign_id = c.id
-            WHERE {where_sql}
-            ORDER BY pl.pledge_date DESC LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
+    rows = conn.execute(data_q.get_sql(), params + [limit, offset]).fetchall()
 
     pledges = []
     for r in rows:
@@ -390,15 +416,15 @@ def get_pledge(conn, args):
     if not pledge_id:
         return err("--id is required")
 
-    row = conn.execute(
-        """SELECT pl.*, cust.name as donor_name, c.name as campaign_name
-           FROM nonprofitclaw_pledge pl
-           LEFT JOIN nonprofitclaw_donor_ext de ON pl.donor_id = de.id
-           LEFT JOIN customer cust ON de.customer_id = cust.id
-           LEFT JOIN nonprofitclaw_campaign c ON pl.campaign_id = c.id
-           WHERE pl.id=?""",
-        (pledge_id,),
-    ).fetchone()
+    q = (
+        Q.from_(_pledge)
+        .left_join(_de).on(_pledge.donor_id == _de.id)
+        .left_join(_c).on(_de.customer_id == _c.id)
+        .left_join(_campaign).on(_pledge.campaign_id == _campaign.id)
+        .select(_pledge.star, _c.name.as_("donor_name"), _campaign.name.as_("campaign_name"))
+        .where(_pledge.id == P())
+    )
+    row = conn.execute(q.get_sql(), (pledge_id,)).fetchone()
     if not row:
         return err(f"Pledge {pledge_id} not found")
 
@@ -417,7 +443,8 @@ def fulfill_pledge(conn, args):
     if not pledge_id:
         return err("--pledge-id or --id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_pledge")).select(Table("nonprofitclaw_pledge").star).where(Field("id") == P()).get_sql(), (pledge_id,)).fetchone()
+    q = Q.from_(_pledge).select(_pledge.star).where(_pledge.id == P())
+    row = conn.execute(q.get_sql(), (pledge_id,)).fetchone()
     if not row:
         return err(f"Pledge {pledge_id} not found")
     if row["status"] in ("fulfilled", "cancelled", "lapsed"):
@@ -444,25 +471,23 @@ def fulfill_pledge(conn, args):
 
     # Transaction (implicit)
     try:
-        conn.execute(
-            """UPDATE nonprofitclaw_pledge SET
-                fulfilled_amount=?, status=?,
-                updated_at=datetime('now')
-               WHERE id=?""",
-            (str(new_fulfilled), new_status, pledge_id),
-        )
+        sql_f, params_f = dynamic_update("nonprofitclaw_pledge",
+            {"fulfilled_amount": str(new_fulfilled), "status": new_status,
+             "updated_at": LiteralValue("datetime('now')")},
+            where={"id": pledge_id})
+        conn.execute(sql_f, params_f)
 
         # Update campaign raised_amount if linked
         campaign_id = row["campaign_id"]
         if campaign_id:
-            conn.execute(
-                """UPDATE nonprofitclaw_campaign SET
-                    raised_amount = CAST(
-                        CAST(raised_amount AS REAL) + ? AS TEXT
-                    ), updated_at=datetime('now')
-                   WHERE id=?""",
-                (float(amount), campaign_id),
+            ct = Table("nonprofitclaw_campaign")
+            camp_upd = (
+                Q.update(ct)
+                .set(ct.raised_amount, LiteralValue("CAST(CAST(raised_amount AS REAL) + ? AS TEXT)"))
+                .set(ct.updated_at, LiteralValue("datetime('now')"))
+                .where(ct.id == P())
             )
+            conn.execute(camp_upd.get_sql(), (float(amount), campaign_id))
 
         conn.commit()
     except Exception as e:
@@ -484,16 +509,17 @@ def cancel_pledge(conn, args):
     if not pledge_id:
         return err("--id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_pledge")).select(Field("id"), Field("company_id"), Field("status")).where(Field("id") == P()).get_sql(), (pledge_id,)).fetchone()
+    q = Q.from_(_pledge).select(_pledge.id, _pledge.company_id, _pledge.status).where(_pledge.id == P())
+    row = conn.execute(q.get_sql(), (pledge_id,)).fetchone()
     if not row:
         return err(f"Pledge {pledge_id} not found")
     if row["status"] in ("fulfilled", "cancelled"):
         return err(f"Cannot cancel pledge in '{row['status']}' status")
 
-    conn.execute(
-        "UPDATE nonprofitclaw_pledge SET status='cancelled', updated_at=datetime('now') WHERE id=?",
-        (pledge_id,),
-    )
+    sql, params = dynamic_update("nonprofitclaw_pledge",
+        {"status": "cancelled", "updated_at": LiteralValue("datetime('now')")},
+        where={"id": pledge_id})
+    conn.execute(sql, params)
     conn.commit()
     audit(conn, SKILL, "nonprofit-cancel-pledge", pledge_id, row["company_id"])
     return ok({"id": pledge_id, "pledge_status": "cancelled"})

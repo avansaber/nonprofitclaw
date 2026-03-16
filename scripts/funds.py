@@ -9,9 +9,17 @@ sys.path.insert(0, os.path.expanduser("~/.openclaw/erpclaw/lib"))
 from erpclaw_lib.naming import get_next_name
 from erpclaw_lib.response import ok, err
 from erpclaw_lib.audit import audit
-from erpclaw_lib.query import Q, P, Table, Field, fn, Order, insert_row, update_row
+from erpclaw_lib.query import (
+    Q, P, Table, Field, fn, Order, LiteralValue,
+    insert_row, update_row, dynamic_update,
+)
 
 SKILL = "nonprofitclaw"
+
+# ── Table aliases ──
+_fund = Table("nonprofitclaw_fund")
+_ft = Table("nonprofitclaw_fund_transfer")
+_ff = Table("nonprofitclaw_fund")  # aliased as source in transfer queries
 
 
 def _dec(val):
@@ -45,20 +53,19 @@ def add_fund(conn, args):
     if target_amount:
         target_amount = str(_round(_dec(target_amount)))
 
-    conn.execute(
-        """INSERT INTO nonprofitclaw_fund
-           (id, naming_series, name, fund_type, description,
-            target_amount, start_date, end_date, is_active, company_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
-        (
-            fund_id, naming, name, fund_type,
-            getattr(args, "description", None),
-            target_amount,
-            getattr(args, "start_date", None),
-            getattr(args, "end_date", None),
-            1, company_id,
-        ),
-    )
+    sql, _ = insert_row("nonprofitclaw_fund", {
+        "id": P(), "naming_series": P(), "name": P(), "fund_type": P(),
+        "description": P(), "target_amount": P(), "start_date": P(),
+        "end_date": P(), "is_active": P(), "company_id": P(),
+    })
+    conn.execute(sql, (
+        fund_id, naming, name, fund_type,
+        getattr(args, "description", None),
+        target_amount,
+        getattr(args, "start_date", None),
+        getattr(args, "end_date", None),
+        1, company_id,
+    ))
     conn.commit()
     audit(conn, SKILL, "nonprofit-add-fund", fund_id, company_id)
     return ok({"id": fund_id, "naming_series": naming, "name": name})
@@ -69,12 +76,12 @@ def update_fund(conn, args):
     if not fund_id:
         return err("--id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id"), Field("company_id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
+    q = Q.from_(_fund).select(_fund.id, _fund.company_id).where(_fund.id == P())
+    row = conn.execute(q.get_sql(), (fund_id,)).fetchone()
     if not row:
         return err(f"Fund {fund_id} not found")
 
-    fields = []
-    values = []
+    data = {}
     for col, attr in [
         ("name", "name"), ("fund_type", "fund_type"),
         ("description", "description"),
@@ -82,25 +89,22 @@ def update_fund(conn, args):
     ]:
         val = getattr(args, attr, None)
         if val is not None:
-            fields.append(f"{col}=?")
-            values.append(val)
+            data[col] = val
 
     target_amount = getattr(args, "target_amount", None)
     if target_amount is not None:
-        fields.append("target_amount=?")
-        values.append(str(_round(_dec(target_amount))))
+        data["target_amount"] = str(_round(_dec(target_amount)))
 
     is_active = getattr(args, "is_active", None)
     if is_active is not None:
-        fields.append("is_active=?")
-        values.append(int(is_active))
+        data["is_active"] = int(is_active)
 
-    if not fields:
+    if not data:
         return err("No fields to update")
 
-    fields.append("updated_at=datetime('now')")
-    values.append(fund_id)
-    conn.execute(f"UPDATE nonprofitclaw_fund SET {', '.join(fields)} WHERE id=?", values)
+    data["updated_at"] = LiteralValue("datetime('now')")
+    sql, params = dynamic_update("nonprofitclaw_fund", data, where={"id": fund_id})
+    conn.execute(sql, params)
     conn.commit()
     audit(conn, SKILL, "nonprofit-update-fund", fund_id, row["company_id"])
     return ok({"id": fund_id, "updated": True})
@@ -114,39 +118,39 @@ def list_funds(conn, args):
     limit = int(getattr(args, "limit", None) or 50)
     offset = int(getattr(args, "offset", None) or 0)
 
-    where = ["company_id=?"]
+    conditions = [_fund.company_id == P()]
     params = [company_id]
 
     fund_type = getattr(args, "fund_type", None)
     if fund_type:
-        where.append("fund_type=?")
+        conditions.append(_fund.fund_type == P())
         params.append(fund_type)
 
     is_active = getattr(args, "is_active", None)
     if is_active is not None:
-        where.append("is_active=?")
+        conditions.append(_fund.is_active == P())
         params.append(int(is_active))
 
     search = getattr(args, "search", None)
     if search:
-        where.append("name LIKE ?")
+        conditions.append(_fund.name.like(P()))
         params.append(f"%{search}%")
 
-    where_sql = " AND ".join(where)
+    count_q = Q.from_(_fund).select(fn.Count("*"))
+    for cond in conditions:
+        count_q = count_q.where(cond)
+    total = conn.execute(count_q.get_sql(), params).fetchone()[0]
 
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM nonprofitclaw_fund WHERE {where_sql}", params
-    ).fetchone()[0]
+    data_q = Q.from_(_fund).select(
+        _fund.id, _fund.naming_series, _fund.name, _fund.fund_type,
+        _fund.description, _fund.target_amount, _fund.current_balance,
+        _fund.is_active, _fund.start_date, _fund.end_date,
+    )
+    for cond in conditions:
+        data_q = data_q.where(cond)
+    data_q = data_q.orderby(_fund.created_at, order=Order.desc).limit(P()).offset(P())
 
-    rows = conn.execute(
-        f"""SELECT id, naming_series, name, fund_type, description,
-                   target_amount, current_balance, is_active,
-                   start_date, end_date
-            FROM nonprofitclaw_fund WHERE {where_sql}
-            ORDER BY created_at DESC LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
-
+    rows = conn.execute(data_q.get_sql(), params + [limit, offset]).fetchall()
     funds = [dict(r) for r in rows]
     return ok({"funds": funds, "total": total})
 
@@ -156,7 +160,8 @@ def get_fund(conn, args):
     if not fund_id:
         return err("--id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Table("nonprofitclaw_fund").star).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
+    q = Q.from_(_fund).select(_fund.star).where(_fund.id == P())
+    row = conn.execute(q.get_sql(), (fund_id,)).fetchone()
     if not row:
         return err(f"Fund {fund_id} not found")
 
@@ -179,8 +184,10 @@ def add_fund_transfer(conn, args):
     if from_fund_id == to_fund_id:
         return err("Source and destination fund must be different")
 
-    from_fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id"), Field("company_id"), Field("current_balance")).where(Field("id") == P()).get_sql(), (from_fund_id,)).fetchone()
-    to_fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id"), Field("company_id")).where(Field("id") == P()).get_sql(), (to_fund_id,)).fetchone()
+    fq = Q.from_(_fund).select(_fund.id, _fund.company_id, _fund.current_balance).where(_fund.id == P())
+    from_fund = conn.execute(fq.get_sql(), (from_fund_id,)).fetchone()
+    tq = Q.from_(_fund).select(_fund.id, _fund.company_id).where(_fund.id == P())
+    to_fund = conn.execute(tq.get_sql(), (to_fund_id,)).fetchone()
     if not from_fund:
         return err(f"Source fund {from_fund_id} not found")
     if not to_fund:
@@ -198,19 +205,17 @@ def add_fund_transfer(conn, args):
     transfer_id = str(uuid.uuid4())
     naming = get_next_name(conn, "nonprofitclaw_fund_transfer", company_id=company_id)
 
-    conn.execute(
-        """INSERT INTO nonprofitclaw_fund_transfer
-           (id, naming_series, from_fund_id, to_fund_id, amount,
-            transfer_date, reason, status, company_id)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
-        (
-            transfer_id, naming, from_fund_id, to_fund_id,
-            str(amount),
-            getattr(args, "transfer_date", None) or str(__import__("datetime").date.today()),
-            getattr(args, "reason", None),
-            "draft", company_id,
-        ),
-    )
+    sql, _ = insert_row("nonprofitclaw_fund_transfer", {
+        "id": P(), "naming_series": P(), "from_fund_id": P(), "to_fund_id": P(),
+        "amount": P(), "transfer_date": P(), "reason": P(), "status": P(), "company_id": P(),
+    })
+    conn.execute(sql, (
+        transfer_id, naming, from_fund_id, to_fund_id,
+        str(amount),
+        getattr(args, "transfer_date", None) or str(__import__("datetime").date.today()),
+        getattr(args, "reason", None),
+        "draft", company_id,
+    ))
     conn.commit()
     audit(conn, SKILL, "nonprofit-add-fund-transfer", transfer_id, company_id)
     return ok({"id": transfer_id, "naming_series": naming, "amount": str(amount)})
@@ -224,37 +229,45 @@ def list_fund_transfers(conn, args):
     limit = int(getattr(args, "limit", None) or 50)
     offset = int(getattr(args, "offset", None) or 0)
 
-    where = ["ft.company_id=?"]
+    ft = _ft
+    ff = Table("nonprofitclaw_fund").as_("ff")
+    tf = Table("nonprofitclaw_fund").as_("tf")
+
+    conditions = [ft.company_id == P()]
     params = [company_id]
 
     status = getattr(args, "status", None)
     if status:
-        where.append("ft.status=?")
+        conditions.append(ft.status == P())
         params.append(status)
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id:
-        where.append("(ft.from_fund_id=? OR ft.to_fund_id=?)")
+        conditions.append((ft.from_fund_id == P()) | (ft.to_fund_id == P()))
         params.extend([fund_id, fund_id])
 
-    where_sql = " AND ".join(where)
+    count_q = Q.from_(ft).select(fn.Count("*"))
+    for cond in conditions:
+        count_q = count_q.where(cond)
+    total = conn.execute(count_q.get_sql(), params).fetchone()[0]
 
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM nonprofitclaw_fund_transfer ft WHERE {where_sql}", params
-    ).fetchone()[0]
+    # Data query with JOINs — use raw aliases for the two fund joins
+    data_q = (
+        Q.from_(ft)
+        .left_join(ff).on(ft.from_fund_id == ff.id)
+        .left_join(tf).on(ft.to_fund_id == tf.id)
+        .select(
+            ft.id, ft.naming_series, ft.from_fund_id,
+            ff.name.as_("from_fund_name"),
+            ft.to_fund_id, tf.name.as_("to_fund_name"),
+            ft.amount, ft.transfer_date, ft.reason, ft.approved_by, ft.status,
+        )
+    )
+    for cond in conditions:
+        data_q = data_q.where(cond)
+    data_q = data_q.orderby(ft.created_at, order=Order.desc).limit(P()).offset(P())
 
-    rows = conn.execute(
-        f"""SELECT ft.id, ft.naming_series, ft.from_fund_id, ff.name as from_fund_name,
-                   ft.to_fund_id, tf.name as to_fund_name,
-                   ft.amount, ft.transfer_date, ft.reason, ft.approved_by, ft.status
-            FROM nonprofitclaw_fund_transfer ft
-            LEFT JOIN nonprofitclaw_fund ff ON ft.from_fund_id = ff.id
-            LEFT JOIN nonprofitclaw_fund tf ON ft.to_fund_id = tf.id
-            WHERE {where_sql}
-            ORDER BY ft.created_at DESC LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
-
+    rows = conn.execute(data_q.get_sql(), params + [limit, offset]).fetchall()
     transfers = [dict(r) for r in rows]
     return ok({"fund_transfers": transfers, "total": total})
 
@@ -264,7 +277,8 @@ def approve_fund_transfer(conn, args):
     if not transfer_id:
         return err("--id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_fund_transfer")).select(Table("nonprofitclaw_fund_transfer").star).where(Field("id") == P()).get_sql(), (transfer_id,)).fetchone()
+    q = Q.from_(_ft).select(_ft.star).where(_ft.id == P())
+    row = conn.execute(q.get_sql(), (transfer_id,)).fetchone()
     if not row:
         return err(f"Fund transfer {transfer_id} not found")
     if row["status"] != "draft":
@@ -275,7 +289,8 @@ def approve_fund_transfer(conn, args):
     to_fund_id = row["to_fund_id"]
 
     # Check source fund has sufficient balance
-    from_fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("current_balance")).where(Field("id") == P()).get_sql(), (from_fund_id,)).fetchone()
+    bq = Q.from_(_fund).select(_fund.current_balance).where(_fund.id == P())
+    from_fund = conn.execute(bq.get_sql(), (from_fund_id,)).fetchone()
     if _dec(from_fund["current_balance"]) < amount:
         return err(f"Insufficient balance in source fund. Available: {from_fund['current_balance']}, Required: {str(amount)}")
 
@@ -284,30 +299,29 @@ def approve_fund_transfer(conn, args):
     # Transaction (implicit)
     try:
         # Debit source fund
-        conn.execute(
-            """UPDATE nonprofitclaw_fund SET
-                current_balance = CAST(
-                    CAST(current_balance AS REAL) - ? AS TEXT
-                ), updated_at=datetime('now')
-               WHERE id=?""",
-            (float(amount), from_fund_id),
+        ft = Table("nonprofitclaw_fund")
+        debit_upd = (
+            Q.update(ft)
+            .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS REAL) - ? AS TEXT)"))
+            .set(ft.updated_at, LiteralValue("datetime('now')"))
+            .where(ft.id == P())
         )
+        conn.execute(debit_upd.get_sql(), (float(amount), from_fund_id))
 
         # Credit destination fund
-        conn.execute(
-            """UPDATE nonprofitclaw_fund SET
-                current_balance = CAST(
-                    CAST(current_balance AS REAL) + ? AS TEXT
-                ), updated_at=datetime('now')
-               WHERE id=?""",
-            (float(amount), to_fund_id),
+        credit_upd = (
+            Q.update(ft)
+            .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS REAL) + ? AS TEXT)"))
+            .set(ft.updated_at, LiteralValue("datetime('now')"))
+            .where(ft.id == P())
         )
+        conn.execute(credit_upd.get_sql(), (float(amount), to_fund_id))
 
         # Mark transfer as completed
-        conn.execute(
-            "UPDATE nonprofitclaw_fund_transfer SET status='completed', approved_by=? WHERE id=?",
-            (approved_by, transfer_id),
-        )
+        sql_c, params_c = dynamic_update("nonprofitclaw_fund_transfer",
+            {"status": "completed", "approved_by": approved_by},
+            where={"id": transfer_id})
+        conn.execute(sql_c, params_c)
 
         conn.commit()
     except Exception as e:
@@ -323,13 +337,17 @@ def fund_balance_report(conn, args):
     if not company_id:
         return err("--company-id is required")
 
-    rows = conn.execute(
-        """SELECT id, naming_series, name, fund_type,
-                  target_amount, current_balance, is_active
-           FROM nonprofitclaw_fund WHERE company_id=? AND is_active=1
-           ORDER BY name""",
-        (company_id,),
-    ).fetchall()
+    q = (
+        Q.from_(_fund)
+        .select(
+            _fund.id, _fund.naming_series, _fund.name, _fund.fund_type,
+            _fund.target_amount, _fund.current_balance, _fund.is_active,
+        )
+        .where(_fund.company_id == P())
+        .where(_fund.is_active == 1)
+        .orderby(_fund.name)
+    )
+    rows = conn.execute(q.get_sql(), (company_id,)).fetchall()
 
     funds = []
     total_balance = Decimal("0")

@@ -13,12 +13,20 @@ from erpclaw_lib.audit import audit
 
 try:
     from erpclaw_lib.gl_posting import insert_gl_entries
-    from erpclaw_lib.query import Q, P, Table, Field, fn, Order, insert_row, update_row
+    from erpclaw_lib.query import (
+        Q, P, Table, Field, fn, Order, LiteralValue,
+        insert_row, update_row, dynamic_update,
+    )
     HAS_GL = True
 except ImportError:
     HAS_GL = False
 
 SKILL = "nonprofitclaw"
+
+# ── Table aliases ──
+_grant = Table("nonprofitclaw_grant")
+_ge = Table("nonprofitclaw_grant_expense")
+_fund = Table("nonprofitclaw_fund")
 
 
 def _dec(val):
@@ -63,27 +71,26 @@ def add_grant(conn, args):
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id:
-        fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
-        if not fund:
+        fq = Q.from_(_fund).select(_fund.id).where(_fund.id == P())
+        if not conn.execute(fq.get_sql(), (fund_id,)).fetchone():
             return err(f"Fund {fund_id} not found")
 
-    conn.execute(
-        """INSERT INTO nonprofitclaw_grant
-           (id, naming_series, name, grantor_name, grantor_type, grant_type,
-            amount, remaining_amount, fund_id,
-            start_date, end_date, reporting_freq,
-            notes, status, company_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            grant_id, naming, name, grantor_name, grantor_type, grant_type,
-            str(amount), str(amount), fund_id,
-            getattr(args, "start_date", None),
-            getattr(args, "end_date", None),
-            reporting_freq,
-            getattr(args, "notes", None),
-            "applied", company_id,
-        ),
-    )
+    sql, _ = insert_row("nonprofitclaw_grant", {
+        "id": P(), "naming_series": P(), "name": P(), "grantor_name": P(),
+        "grantor_type": P(), "grant_type": P(), "amount": P(),
+        "remaining_amount": P(), "fund_id": P(), "start_date": P(),
+        "end_date": P(), "reporting_freq": P(), "notes": P(), "status": P(),
+        "company_id": P(),
+    })
+    conn.execute(sql, (
+        grant_id, naming, name, grantor_name, grantor_type, grant_type,
+        str(amount), str(amount), fund_id,
+        getattr(args, "start_date", None),
+        getattr(args, "end_date", None),
+        reporting_freq,
+        getattr(args, "notes", None),
+        "applied", company_id,
+    ))
     conn.commit()
     audit(conn, SKILL, "nonprofit-add-grant", grant_id, company_id)
     return ok({"id": grant_id, "naming_series": naming, "name": name, "amount": str(amount)})
@@ -94,14 +101,14 @@ def update_grant(conn, args):
     if not grant_id:
         return err("--id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_grant")).select(Field("id"), Field("company_id"), Field("status")).where(Field("id") == P()).get_sql(), (grant_id,)).fetchone()
+    q = Q.from_(_grant).select(_grant.id, _grant.company_id, _grant.status).where(_grant.id == P())
+    row = conn.execute(q.get_sql(), (grant_id,)).fetchone()
     if not row:
         return err(f"Grant {grant_id} not found")
     if row["status"] in ("closed", "rejected"):
         return err(f"Cannot update grant in '{row['status']}' status")
 
-    fields = []
-    values = []
+    data = {}
     for col, attr in [
         ("name", "name"), ("grantor_name", "grantor_name"),
         ("grantor_type", "grantor_type"), ("grant_type", "grant_type"),
@@ -111,24 +118,22 @@ def update_grant(conn, args):
     ]:
         val = getattr(args, attr, None)
         if val is not None:
-            fields.append(f"{col}=?")
-            values.append(val)
+            data[col] = val
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id is not None:
         if fund_id:
-            fund = conn.execute(Q.from_(Table("nonprofitclaw_fund")).select(Field("id")).where(Field("id") == P()).get_sql(), (fund_id,)).fetchone()
-            if not fund:
+            fq = Q.from_(_fund).select(_fund.id).where(_fund.id == P())
+            if not conn.execute(fq.get_sql(), (fund_id,)).fetchone():
                 return err(f"Fund {fund_id} not found")
-        fields.append("fund_id=?")
-        values.append(fund_id if fund_id else None)
+        data["fund_id"] = fund_id if fund_id else None
 
-    if not fields:
+    if not data:
         return err("No fields to update")
 
-    fields.append("updated_at=datetime('now')")
-    values.append(grant_id)
-    conn.execute(f"UPDATE nonprofitclaw_grant SET {', '.join(fields)} WHERE id=?", values)
+    data["updated_at"] = LiteralValue("datetime('now')")
+    sql, params = dynamic_update("nonprofitclaw_grant", data, where={"id": grant_id})
+    conn.execute(sql, params)
     conn.commit()
     audit(conn, SKILL, "nonprofit-update-grant", grant_id, row["company_id"])
     return ok({"id": grant_id, "updated": True})
@@ -142,44 +147,45 @@ def list_grants(conn, args):
     limit = int(getattr(args, "limit", None) or 50)
     offset = int(getattr(args, "offset", None) or 0)
 
-    where = ["company_id=?"]
+    conditions = [_grant.company_id == P()]
     params = [company_id]
 
     status = getattr(args, "status", None)
     if status:
-        where.append("status=?")
+        conditions.append(_grant.status == P())
         params.append(status)
 
     grantor_type = getattr(args, "grantor_type", None)
     if grantor_type:
-        where.append("grantor_type=?")
+        conditions.append(_grant.grantor_type == P())
         params.append(grantor_type)
 
     grant_type = getattr(args, "grant_type", None)
     if grant_type:
-        where.append("grant_type=?")
+        conditions.append(_grant.grant_type == P())
         params.append(grant_type)
 
     search = getattr(args, "search", None)
     if search:
-        where.append("(name LIKE ? OR grantor_name LIKE ?)")
+        conditions.append(_grant.name.like(P()) | _grant.grantor_name.like(P()))
         params.extend([f"%{search}%", f"%{search}%"])
 
-    where_sql = " AND ".join(where)
+    count_q = Q.from_(_grant).select(fn.Count("*"))
+    for cond in conditions:
+        count_q = count_q.where(cond)
+    total = conn.execute(count_q.get_sql(), params).fetchone()[0]
 
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM nonprofitclaw_grant WHERE {where_sql}", params
-    ).fetchone()[0]
+    data_q = Q.from_(_grant).select(
+        _grant.id, _grant.naming_series, _grant.name, _grant.grantor_name,
+        _grant.grantor_type, _grant.grant_type, _grant.amount,
+        _grant.received_amount, _grant.spent_amount, _grant.remaining_amount,
+        _grant.status, _grant.start_date, _grant.end_date,
+    )
+    for cond in conditions:
+        data_q = data_q.where(cond)
+    data_q = data_q.orderby(_grant.created_at, order=Order.desc).limit(P()).offset(P())
 
-    rows = conn.execute(
-        f"""SELECT id, naming_series, name, grantor_name, grantor_type, grant_type,
-                   amount, received_amount, spent_amount, remaining_amount,
-                   status, start_date, end_date
-            FROM nonprofitclaw_grant WHERE {where_sql}
-            ORDER BY created_at DESC LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
-
+    rows = conn.execute(data_q.get_sql(), params + [limit, offset]).fetchall()
     grants = [dict(r) for r in rows]
     return ok({"grants": grants, "total": total})
 
@@ -189,20 +195,24 @@ def get_grant(conn, args):
     if not grant_id:
         return err("--id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_grant")).select(Table("nonprofitclaw_grant").star).where(Field("id") == P()).get_sql(), (grant_id,)).fetchone()
+    q = Q.from_(_grant).select(_grant.star).where(_grant.id == P())
+    row = conn.execute(q.get_sql(), (grant_id,)).fetchone()
     if not row:
         return err(f"Grant {grant_id} not found")
 
     # Also fetch expenses summary
-    expense_summary = conn.execute(
-        """SELECT category,
-                  COUNT(*) as count,
-                  SUM(CAST(amount AS REAL)) as total
-           FROM nonprofitclaw_grant_expense
-           WHERE grant_id=? AND status='approved'
-           GROUP BY category""",
-        (grant_id,),
-    ).fetchall()
+    exp_q = (
+        Q.from_(_ge)
+        .select(
+            _ge.category,
+            fn.Count("*").as_("count"),
+            LiteralValue("SUM(CAST(amount AS REAL))").as_("total"),
+        )
+        .where(_ge.grant_id == P())
+        .where(_ge.status == "approved")
+        .groupby(_ge.category)
+    )
+    expense_summary = conn.execute(exp_q.get_sql(), (grant_id,)).fetchall()
 
     grant_data = dict(row)
     grant_data["expense_summary"] = [dict(e) for e in expense_summary]
@@ -214,7 +224,8 @@ def activate_grant(conn, args):
     if not grant_id:
         return err("--id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_grant")).select(Table("nonprofitclaw_grant").star).where(Field("id") == P()).get_sql(), (grant_id,)).fetchone()
+    q = Q.from_(_grant).select(_grant.star).where(_grant.id == P())
+    row = conn.execute(q.get_sql(), (grant_id,)).fetchone()
     if not row:
         return err(f"Grant {grant_id} not found")
     if row["status"] not in ("applied", "awarded"):
@@ -226,26 +237,22 @@ def activate_grant(conn, args):
     else:
         received = _dec(row["amount"])
 
-    conn.execute(
-        """UPDATE nonprofitclaw_grant SET
-            status='active',
-            received_amount=?,
-            remaining_amount=?,
-            updated_at=datetime('now')
-           WHERE id=?""",
-        (str(received), str(received), grant_id),
-    )
+    sql, params = dynamic_update("nonprofitclaw_grant",
+        {"status": "active", "received_amount": str(received),
+         "remaining_amount": str(received), "updated_at": LiteralValue("datetime('now')")},
+        where={"id": grant_id})
+    conn.execute(sql, params)
 
     # If linked to a fund, update fund balance
     if row["fund_id"]:
-        conn.execute(
-            """UPDATE nonprofitclaw_fund SET
-                current_balance = CAST(
-                    CAST(current_balance AS REAL) + ? AS TEXT
-                ), updated_at=datetime('now')
-               WHERE id=?""",
-            (float(received), row["fund_id"]),
+        ft = Table("nonprofitclaw_fund")
+        fund_upd = (
+            Q.update(ft)
+            .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS REAL) + ? AS TEXT)"))
+            .set(ft.updated_at, LiteralValue("datetime('now')"))
+            .where(ft.id == P())
         )
+        conn.execute(fund_upd.get_sql(), (float(received), row["fund_id"]))
 
     conn.commit()
     audit(conn, SKILL, "nonprofit-activate-grant", grant_id, row["company_id"])
@@ -265,10 +272,8 @@ def add_grant_expense(conn, args):
     if not grant_id:
         return err("--grant-id is required")
 
-    grant = conn.execute(
-        "SELECT id, company_id, status, remaining_amount FROM nonprofitclaw_grant WHERE id=?",
-        (grant_id,),
-    ).fetchone()
+    gq = Q.from_(_grant).select(_grant.id, _grant.company_id, _grant.status, _grant.remaining_amount).where(_grant.id == P())
+    grant = conn.execute(gq.get_sql(), (grant_id,)).fetchone()
     if not grant:
         return err(f"Grant {grant_id} not found")
     if grant["company_id"] != company_id:
@@ -287,20 +292,19 @@ def add_grant_expense(conn, args):
     naming = get_next_name(conn, "nonprofitclaw_grant_expense", company_id=company_id)
     category = getattr(args, "category", None) or "program"
 
-    conn.execute(
-        """INSERT INTO nonprofitclaw_grant_expense
-           (id, naming_series, grant_id, expense_date, amount, category,
-            description, receipt_reference, status, company_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
-        (
-            expense_id, naming, grant_id,
-            getattr(args, "expense_date", None) or str(__import__("datetime").date.today()),
-            str(amount), category,
-            getattr(args, "description", None),
-            getattr(args, "receipt_reference", None),
-            "draft", company_id,
-        ),
-    )
+    sql, _ = insert_row("nonprofitclaw_grant_expense", {
+        "id": P(), "naming_series": P(), "grant_id": P(), "expense_date": P(),
+        "amount": P(), "category": P(), "description": P(),
+        "receipt_reference": P(), "status": P(), "company_id": P(),
+    })
+    conn.execute(sql, (
+        expense_id, naming, grant_id,
+        getattr(args, "expense_date", None) or str(__import__("datetime").date.today()),
+        str(amount), category,
+        getattr(args, "description", None),
+        getattr(args, "receipt_reference", None),
+        "draft", company_id,
+    ))
     conn.commit()
     audit(conn, SKILL, "nonprofit-add-grant-expense", expense_id, company_id)
     return ok({"id": expense_id, "naming_series": naming, "amount": str(amount)})
@@ -314,51 +318,56 @@ def list_grant_expenses(conn, args):
     limit = int(getattr(args, "limit", None) or 50)
     offset = int(getattr(args, "offset", None) or 0)
 
-    where = ["ge.company_id=?"]
+    ge = _ge
+    g = _grant
+
+    conditions = [ge.company_id == P()]
     params = [company_id]
 
     grant_id = getattr(args, "grant_id", None)
     if grant_id:
-        where.append("ge.grant_id=?")
+        conditions.append(ge.grant_id == P())
         params.append(grant_id)
 
     status = getattr(args, "status", None)
     if status:
-        where.append("ge.status=?")
+        conditions.append(ge.status == P())
         params.append(status)
 
     category = getattr(args, "category", None)
     if category:
-        where.append("ge.category=?")
+        conditions.append(ge.category == P())
         params.append(category)
 
     from_date = getattr(args, "from_date", None)
     if from_date:
-        where.append("ge.expense_date >= ?")
+        conditions.append(ge.expense_date >= P())
         params.append(from_date)
 
     to_date = getattr(args, "to_date", None)
     if to_date:
-        where.append("ge.expense_date <= ?")
+        conditions.append(ge.expense_date <= P())
         params.append(to_date)
 
-    where_sql = " AND ".join(where)
+    count_q = Q.from_(ge).select(fn.Count("*"))
+    for cond in conditions:
+        count_q = count_q.where(cond)
+    total = conn.execute(count_q.get_sql(), params).fetchone()[0]
 
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM nonprofitclaw_grant_expense ge WHERE {where_sql}", params
-    ).fetchone()[0]
+    data_q = (
+        Q.from_(ge)
+        .left_join(g).on(ge.grant_id == g.id)
+        .select(
+            ge.id, ge.naming_series, ge.grant_id, g.name.as_("grant_name"),
+            ge.expense_date, ge.amount, ge.category,
+            ge.description, ge.receipt_reference, ge.status,
+        )
+    )
+    for cond in conditions:
+        data_q = data_q.where(cond)
+    data_q = data_q.orderby(ge.expense_date, order=Order.desc).limit(P()).offset(P())
 
-    rows = conn.execute(
-        f"""SELECT ge.id, ge.naming_series, ge.grant_id, g.name as grant_name,
-                   ge.expense_date, ge.amount, ge.category,
-                   ge.description, ge.receipt_reference, ge.status
-            FROM nonprofitclaw_grant_expense ge
-            LEFT JOIN nonprofitclaw_grant g ON ge.grant_id = g.id
-            WHERE {where_sql}
-            ORDER BY ge.expense_date DESC LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
-
+    rows = conn.execute(data_q.get_sql(), params + [limit, offset]).fetchall()
     expenses = [dict(r) for r in rows]
     return ok({"grant_expenses": expenses, "total": total})
 
@@ -368,7 +377,8 @@ def approve_grant_expense(conn, args):
     if not expense_id:
         return err("--id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_grant_expense")).select(Table("nonprofitclaw_grant_expense").star).where(Field("id") == P()).get_sql(), (expense_id,)).fetchone()
+    q = Q.from_(_ge).select(_ge.star).where(_ge.id == P())
+    row = conn.execute(q.get_sql(), (expense_id,)).fetchone()
     if not row:
         return err(f"Grant expense {expense_id} not found")
     if row["status"] != "draft" and row["status"] != "submitted":
@@ -379,7 +389,8 @@ def approve_grant_expense(conn, args):
     expense_date = row["expense_date"]
     company_id = row["company_id"]
 
-    grant = conn.execute(Q.from_(Table("nonprofitclaw_grant")).select(Field("remaining_amount")).where(Field("id") == P()).get_sql(), (grant_id,)).fetchone()
+    rq = Q.from_(_grant).select(_grant.remaining_amount).where(_grant.id == P())
+    grant = conn.execute(rq.get_sql(), (grant_id,)).fetchone()
     if not grant:
         return err(f"Grant {grant_id} not found")
 
@@ -395,10 +406,9 @@ def approve_grant_expense(conn, args):
     # Transaction (implicit)
     gl_entry_ids = None
     try:
-        conn.execute(
-            "UPDATE nonprofitclaw_grant_expense SET status='approved' WHERE id=?",
-            (expense_id,),
-        )
+        sql_a, params_a = dynamic_update("nonprofitclaw_grant_expense",
+            {"status": "approved"}, where={"id": expense_id})
+        conn.execute(sql_a, params_a)
 
         # --- GL Posting: DR Program Expense, CR Cash/Bank ---
         if HAS_GL and expense_account_id and cash_account_id:
@@ -427,31 +437,32 @@ def approve_grant_expense(conn, args):
                     remarks=f"Grant expense {expense_id} for grant {grant_id}",
                 )
                 gl_entry_ids = json.dumps(ids)
-                conn.execute(
-                    "UPDATE nonprofitclaw_grant_expense SET gl_entry_ids=? WHERE id=?",
-                    (gl_entry_ids, expense_id),
-                )
+                sql_gl, params_gl = dynamic_update("nonprofitclaw_grant_expense",
+                    {"gl_entry_ids": gl_entry_ids}, where={"id": expense_id})
+                conn.execute(sql_gl, params_gl)
             except (ValueError, Exception):
                 # GL posting failed — expense approval still proceeds
                 pass
 
+        spent_q = (
+            Q.from_(_ge)
+            .select(LiteralValue("SUM(CAST(amount AS REAL))"))
+            .where(_ge.grant_id == P())
+            .where(_ge.status == "approved")
+        )
         new_spent = str(_round(_dec(
-            conn.execute(
-                "SELECT SUM(CAST(amount AS REAL)) FROM nonprofitclaw_grant_expense WHERE grant_id=? AND status='approved'",
-                (grant_id,),
-            ).fetchone()[0]
+            conn.execute(spent_q.get_sql(), (grant_id,)).fetchone()[0]
         )))
 
-        grant_full = conn.execute(Q.from_(Table("nonprofitclaw_grant")).select(Field("amount")).where(Field("id") == P()).get_sql(), (grant_id,)).fetchone()
+        aq = Q.from_(_grant).select(_grant.amount).where(_grant.id == P())
+        grant_full = conn.execute(aq.get_sql(), (grant_id,)).fetchone()
         new_remaining = str(_round(_dec(grant_full["amount"]) - _dec(new_spent)))
 
-        conn.execute(
-            """UPDATE nonprofitclaw_grant SET
-                spent_amount=?, remaining_amount=?,
-                updated_at=datetime('now')
-               WHERE id=?""",
-            (new_spent, new_remaining, grant_id),
-        )
+        sql_g, params_g = dynamic_update("nonprofitclaw_grant",
+            {"spent_amount": new_spent, "remaining_amount": new_remaining,
+             "updated_at": LiteralValue("datetime('now')")},
+            where={"id": grant_id})
+        conn.execute(sql_g, params_g)
 
         conn.commit()
     except Exception as e:
@@ -476,15 +487,20 @@ def grant_status_report(conn, args):
     if not company_id:
         return err("--company-id is required")
 
-    rows = conn.execute(
-        """SELECT id, naming_series, name, grantor_name, grant_type,
-                  amount, received_amount, spent_amount, remaining_amount,
-                  status, start_date, end_date, reporting_freq, next_report_due
-           FROM nonprofitclaw_grant
-           WHERE company_id=? AND status IN ('active','awarded')
-           ORDER BY end_date ASC NULLS LAST""",
-        (company_id,),
-    ).fetchall()
+    q = (
+        Q.from_(_grant)
+        .select(
+            _grant.id, _grant.naming_series, _grant.name, _grant.grantor_name,
+            _grant.grant_type, _grant.amount, _grant.received_amount,
+            _grant.spent_amount, _grant.remaining_amount, _grant.status,
+            _grant.start_date, _grant.end_date, _grant.reporting_freq,
+            _grant.next_report_due,
+        )
+        .where(_grant.company_id == P())
+        .where(_grant.status.isin(["active", "awarded"]))
+        .orderby(LiteralValue("end_date ASC NULLS LAST"))
+    )
+    rows = conn.execute(q.get_sql(), (company_id,)).fetchall()
 
     grants = []
     total_awarded = Decimal("0")
@@ -516,25 +532,29 @@ def close_grant(conn, args):
     if not grant_id:
         return err("--id is required")
 
-    row = conn.execute(Q.from_(Table("nonprofitclaw_grant")).select(Table("nonprofitclaw_grant").star).where(Field("id") == P()).get_sql(), (grant_id,)).fetchone()
+    q = Q.from_(_grant).select(_grant.star).where(_grant.id == P())
+    row = conn.execute(q.get_sql(), (grant_id,)).fetchone()
     if not row:
         return err(f"Grant {grant_id} not found")
     if row["status"] in ("closed", "rejected"):
         return err(f"Grant is already '{row['status']}'")
 
     # Check for pending expenses
-    pending = conn.execute(
-        "SELECT COUNT(*) FROM nonprofitclaw_grant_expense WHERE grant_id=? AND status IN ('draft','submitted')",
-        (grant_id,),
-    ).fetchone()[0]
+    pq = (
+        Q.from_(_ge)
+        .select(fn.Count("*"))
+        .where(_ge.grant_id == P())
+        .where(_ge.status.isin(["draft", "submitted"]))
+    )
+    pending = conn.execute(pq.get_sql(), (grant_id,)).fetchone()[0]
     if pending > 0:
         return err(f"Cannot close grant: {pending} pending expense(s) exist")
 
     final_status = "completed" if row["status"] == "active" else "closed"
-    conn.execute(
-        "UPDATE nonprofitclaw_grant SET status=?, updated_at=datetime('now') WHERE id=?",
-        (final_status, grant_id),
-    )
+    sql, params = dynamic_update("nonprofitclaw_grant",
+        {"status": final_status, "updated_at": LiteralValue("datetime('now')")},
+        where={"id": grant_id})
+    conn.execute(sql, params)
     conn.commit()
     audit(conn, SKILL, "nonprofit-close-grant", grant_id, row["company_id"])
     return ok({

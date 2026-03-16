@@ -10,9 +10,27 @@ sys.path.insert(0, os.path.expanduser("~/.openclaw/erpclaw/lib"))
 from erpclaw_lib.naming import get_next_name
 from erpclaw_lib.response import ok, err
 from erpclaw_lib.audit import audit
-from erpclaw_lib.query import Q, P, Table, Field, fn, Order, insert_row, update_row
+from erpclaw_lib.query import (
+    Q, P, Table, Field, fn, Order, LiteralValue,
+    insert_row, update_row, dynamic_update,
+)
 
 SKILL = "nonprofitclaw"
+
+# ── Table aliases ──
+_de = Table("nonprofitclaw_donor_ext")
+_c = Table("customer")
+_don = Table("nonprofitclaw_donation")
+_receipt = Table("nonprofitclaw_tax_receipt")
+_fund = Table("nonprofitclaw_fund")
+_ft = Table("nonprofitclaw_fund_transfer")
+_grant = Table("nonprofitclaw_grant")
+_ge = Table("nonprofitclaw_grant_expense")
+_prog = Table("nonprofitclaw_program")
+_vol = Table("nonprofitclaw_volunteer")
+_vs = Table("nonprofitclaw_volunteer_shift")
+_pledge = Table("nonprofitclaw_pledge")
+_campaign = Table("nonprofitclaw_campaign")
 
 
 def _dec(val):
@@ -38,13 +56,13 @@ def generate_tax_receipt(conn, args):
     if not donor_id:
         return err("--donor-id is required")
 
-    donor = conn.execute(
-        """SELECT de.id, c.name, de.company_id
-           FROM nonprofitclaw_donor_ext de
-           JOIN customer c ON de.customer_id = c.id
-           WHERE de.id=?""",
-        (donor_id,),
-    ).fetchone()
+    q = (
+        Q.from_(_de)
+        .join(_c).on(_de.customer_id == _c.id)
+        .select(_de.id, _c.name, _de.company_id)
+        .where(_de.id == P())
+    )
+    donor = conn.execute(q.get_sql(), (donor_id,)).fetchone()
     if not donor:
         return err(f"Donor {donor_id} not found")
     if donor["company_id"] != company_id:
@@ -63,10 +81,13 @@ def generate_tax_receipt(conn, args):
         if not donation_id:
             return err("--donation-id is required for single receipt type")
 
-        donation = conn.execute(
-            "SELECT id, amount, tax_deductible, status FROM nonprofitclaw_donation WHERE id=? AND donor_id=?",
-            (donation_id, donor_id),
-        ).fetchone()
+        dq = (
+            Q.from_(_don)
+            .select(_don.id, _don.amount, _don.tax_deductible, _don.status)
+            .where(_don.id == P())
+            .where(_don.donor_id == P())
+        )
+        donation = conn.execute(dq.get_sql(), (donation_id, donor_id)).fetchone()
         if not donation:
             return err(f"Donation {donation_id} not found for this donor")
         if donation["status"] in ("refunded", "cancelled"):
@@ -77,20 +98,23 @@ def generate_tax_receipt(conn, args):
         amount = donation["amount"]
 
         # Check for duplicate receipt
-        existing = conn.execute(Q.from_(Table("nonprofitclaw_tax_receipt")).select(Field("id")).where(Field("donation_id") == P()).get_sql(), (donation_id,)).fetchone()
+        dup_q = Q.from_(_receipt).select(_receipt.id).where(_receipt.donation_id == P())
+        existing = conn.execute(dup_q.get_sql(), (donation_id,)).fetchone()
         if existing:
             return err(f"Tax receipt already exists for this donation: {existing['id']}")
 
     elif receipt_type == "annual_summary":
         # Annual summary receipt — aggregate all deductible donations for the year
-        total_row = conn.execute(
-            """SELECT SUM(CAST(amount AS REAL)) as total
-               FROM nonprofitclaw_donation
-               WHERE donor_id=? AND company_id=? AND tax_deductible=1
-                     AND status NOT IN ('refunded','cancelled')
-                     AND strftime('%%Y', donation_date) = ?""",
-            (donor_id, company_id, tax_year),
-        ).fetchone()
+        total_q = (
+            Q.from_(_don)
+            .select(LiteralValue("SUM(CAST(amount AS REAL))").as_("total"))
+            .where(_don.donor_id == P())
+            .where(_don.company_id == P())
+            .where(_don.tax_deductible == 1)
+            .where(_don.status.notin(["refunded", "cancelled"]))
+            .where(LiteralValue("strftime('%Y', donation_date)") == P())
+        )
+        total_row = conn.execute(total_q.get_sql(), (donor_id, company_id, tax_year)).fetchone()
 
         if not total_row["total"]:
             return err(f"No tax-deductible donations found for donor in {tax_year}")
@@ -103,25 +127,24 @@ def generate_tax_receipt(conn, args):
     receipt_id = str(uuid.uuid4())
     naming = get_next_name(conn, "nonprofitclaw_tax_receipt", company_id=company_id)
 
-    conn.execute(
-        """INSERT INTO nonprofitclaw_tax_receipt
-           (id, naming_series, donor_id, donation_id, receipt_date,
-            amount, tax_year, receipt_type, sent_date, sent_method, company_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            receipt_id, naming, donor_id, donation_id,
-            str(date.today()), amount, tax_year, receipt_type,
-            str(date.today()) if sent_method else None,
-            sent_method, company_id,
-        ),
-    )
+    sql, _ = insert_row("nonprofitclaw_tax_receipt", {
+        "id": P(), "naming_series": P(), "donor_id": P(), "donation_id": P(),
+        "receipt_date": P(), "amount": P(), "tax_year": P(), "receipt_type": P(),
+        "sent_date": P(), "sent_method": P(), "company_id": P(),
+    })
+    conn.execute(sql, (
+        receipt_id, naming, donor_id, donation_id,
+        str(date.today()), amount, tax_year, receipt_type,
+        str(date.today()) if sent_method else None,
+        sent_method, company_id,
+    ))
 
     # Mark donation as receipt_sent if single
     if donation_id:
-        conn.execute(
-            "UPDATE nonprofitclaw_donation SET receipt_sent=1, updated_at=datetime('now') WHERE id=?",
-            (donation_id,),
-        )
+        sql_u, params_u = dynamic_update("nonprofitclaw_donation",
+            {"receipt_sent": 1, "updated_at": LiteralValue("datetime('now')")},
+            where={"id": donation_id})
+        conn.execute(sql_u, params_u)
 
     conn.commit()
     audit(conn, SKILL, "nonprofit-generate-tax-receipt", receipt_id, company_id)
@@ -143,42 +166,48 @@ def list_tax_receipts(conn, args):
     limit = int(getattr(args, "limit", None) or 50)
     offset = int(getattr(args, "offset", None) or 0)
 
-    where = ["tr.company_id=?"]
+    tr = _receipt
+    de = _de
+    cust = _c
+
+    conditions = [tr.company_id == P()]
     params = [company_id]
 
     donor_id = getattr(args, "donor_id", None)
     if donor_id:
-        where.append("tr.donor_id=?")
+        conditions.append(tr.donor_id == P())
         params.append(donor_id)
 
     tax_year = getattr(args, "tax_year", None)
     if tax_year:
-        where.append("tr.tax_year=?")
+        conditions.append(tr.tax_year == P())
         params.append(tax_year)
 
     receipt_type = getattr(args, "receipt_type", None)
     if receipt_type:
-        where.append("tr.receipt_type=?")
+        conditions.append(tr.receipt_type == P())
         params.append(receipt_type)
 
-    where_sql = " AND ".join(where)
+    count_q = Q.from_(tr).select(fn.Count("*"))
+    for cond in conditions:
+        count_q = count_q.where(cond)
+    total = conn.execute(count_q.get_sql(), params).fetchone()[0]
 
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM nonprofitclaw_tax_receipt tr WHERE {where_sql}", params
-    ).fetchone()[0]
+    data_q = (
+        Q.from_(tr)
+        .left_join(de).on(tr.donor_id == de.id)
+        .left_join(cust).on(de.customer_id == cust.id)
+        .select(
+            tr.id, tr.naming_series, tr.donor_id, cust.name.as_("donor_name"),
+            tr.donation_id, tr.receipt_date, tr.amount, tr.tax_year,
+            tr.receipt_type, tr.sent_date, tr.sent_method,
+        )
+    )
+    for cond in conditions:
+        data_q = data_q.where(cond)
+    data_q = data_q.orderby(tr.receipt_date, order=Order.desc).limit(P()).offset(P())
 
-    rows = conn.execute(
-        f"""SELECT tr.id, tr.naming_series, tr.donor_id, cust.name as donor_name,
-                   tr.donation_id, tr.receipt_date, tr.amount, tr.tax_year,
-                   tr.receipt_type, tr.sent_date, tr.sent_method
-            FROM nonprofitclaw_tax_receipt tr
-            LEFT JOIN nonprofitclaw_donor_ext de ON tr.donor_id = de.id
-            LEFT JOIN customer cust ON de.customer_id = cust.id
-            WHERE {where_sql}
-            ORDER BY tr.receipt_date DESC LIMIT ? OFFSET ?""",
-        params + [limit, offset],
-    ).fetchall()
-
+    rows = conn.execute(data_q.get_sql(), params + [limit, offset]).fetchall()
     receipts = [dict(r) for r in rows]
     return ok({"tax_receipts": receipts, "total": total})
 
@@ -193,57 +222,73 @@ def donor_summary(conn, args):
         return err("--company-id is required")
 
     # Overall donor stats
-    donor_stats = conn.execute(
-        """SELECT
-            COUNT(*) as total_donors,
-            SUM(CASE WHEN de.is_active=1 THEN 1 ELSE 0 END) as active_donors,
-            SUM(CASE WHEN de.donor_type='individual' THEN 1 ELSE 0 END) as individual_donors,
-            SUM(CASE WHEN de.donor_type='corporate' THEN 1 ELSE 0 END) as org_donors,
-            SUM(CASE WHEN de.donor_type='foundation' THEN 1 ELSE 0 END) as foundation_donors
-           FROM nonprofitclaw_donor_ext de WHERE de.company_id=?""",
-        (company_id,),
-    ).fetchone()
+    ds_q = (
+        Q.from_(_de)
+        .select(
+            fn.Count("*").as_("total_donors"),
+            LiteralValue("SUM(CASE WHEN is_active=1 THEN 1 ELSE 0 END)").as_("active_donors"),
+            LiteralValue("SUM(CASE WHEN donor_type='individual' THEN 1 ELSE 0 END)").as_("individual_donors"),
+            LiteralValue("SUM(CASE WHEN donor_type='corporate' THEN 1 ELSE 0 END)").as_("org_donors"),
+            LiteralValue("SUM(CASE WHEN donor_type='foundation' THEN 1 ELSE 0 END)").as_("foundation_donors"),
+        )
+        .where(_de.company_id == P())
+    )
+    donor_stats = conn.execute(ds_q.get_sql(), (company_id,)).fetchone()
 
     # Donation stats
-    donation_stats = conn.execute(
-        """SELECT
-            COUNT(*) as total_donations,
-            SUM(CAST(amount AS REAL)) as total_amount,
-            AVG(CAST(amount AS REAL)) as avg_donation
-           FROM nonprofitclaw_donation
-           WHERE company_id=? AND status NOT IN ('refunded','cancelled')""",
-        (company_id,),
-    ).fetchone()
+    don_q = (
+        Q.from_(_don)
+        .select(
+            fn.Count("*").as_("total_donations"),
+            LiteralValue("SUM(CAST(amount AS REAL))").as_("total_amount"),
+            LiteralValue("AVG(CAST(amount AS REAL))").as_("avg_donation"),
+        )
+        .where(_don.company_id == P())
+        .where(_don.status.notin(["refunded", "cancelled"]))
+    )
+    donation_stats = conn.execute(don_q.get_sql(), (company_id,)).fetchone()
 
     # Donor level breakdown
-    level_breakdown = conn.execute(
-        """SELECT donor_level, COUNT(*) as count
-           FROM nonprofitclaw_donor_ext WHERE company_id=? AND is_active=1
-           GROUP BY donor_level ORDER BY count DESC""",
-        (company_id,),
-    ).fetchall()
+    level_q = (
+        Q.from_(_de)
+        .select(_de.donor_level, fn.Count("*").as_("count"))
+        .where(_de.company_id == P())
+        .where(_de.is_active == 1)
+        .groupby(_de.donor_level)
+        .orderby(Field("count"), order=Order.desc)
+    )
+    level_breakdown = conn.execute(level_q.get_sql(), (company_id,)).fetchall()
 
     # Top donors
-    top_donors = conn.execute(
-        """SELECT de.id, c.name, de.donor_type, de.total_donated, de.donation_count, de.donor_level
-           FROM nonprofitclaw_donor_ext de
-           JOIN customer c ON de.customer_id = c.id
-           WHERE de.company_id=? AND de.is_active=1
-           ORDER BY CAST(de.total_donated AS REAL) DESC LIMIT 10""",
-        (company_id,),
-    ).fetchall()
+    top_q = (
+        Q.from_(_de)
+        .join(_c).on(_de.customer_id == _c.id)
+        .select(
+            _de.id, _c.name, _de.donor_type, _de.total_donated,
+            _de.donation_count, _de.donor_level,
+        )
+        .where(_de.company_id == P())
+        .where(_de.is_active == 1)
+        .orderby(LiteralValue("CAST(\"nonprofitclaw_donor_ext\".\"total_donated\" AS REAL)"), order=Order.desc)
+        .limit(10)
+    )
+    top_donors = conn.execute(top_q.get_sql(), (company_id,)).fetchall()
 
     # Monthly trend (last 12 months)
-    monthly_trend = conn.execute(
-        """SELECT strftime('%%Y-%%m', donation_date) as month,
-                  COUNT(*) as count,
-                  SUM(CAST(amount AS REAL)) as total
-           FROM nonprofitclaw_donation
-           WHERE company_id=? AND status NOT IN ('refunded','cancelled')
-                 AND donation_date >= date('now', '-12 months')
-           GROUP BY month ORDER BY month""",
-        (company_id,),
-    ).fetchall()
+    trend_q = (
+        Q.from_(_don)
+        .select(
+            LiteralValue("strftime('%Y-%m', donation_date)").as_("month"),
+            fn.Count("*").as_("count"),
+            LiteralValue("SUM(CAST(amount AS REAL))").as_("total"),
+        )
+        .where(_don.company_id == P())
+        .where(_don.status.notin(["refunded", "cancelled"]))
+        .where(_don.donation_date >= LiteralValue("date('now', '-12 months')"))
+        .groupby(LiteralValue("month"))
+        .orderby(LiteralValue("month"))
+    )
+    monthly_trend = conn.execute(trend_q.get_sql(), (company_id,)).fetchall()
 
     trend = []
     for m in monthly_trend:
@@ -293,34 +338,41 @@ def module_status(conn, args):
         ("tax_receipts", "nonprofitclaw_tax_receipt"),
     ]
 
-    for label, table in tables:
+    for label, table_name in tables:
         try:
-            row = conn.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE company_id=?", (company_id,)
-            ).fetchone()
+            t = Table(table_name)
+            q = Q.from_(t).select(fn.Count("*")).where(Field("company_id") == P())
+            row = conn.execute(q.get_sql(), (company_id,)).fetchone()
             counts[label] = row[0]
         except Exception:
             counts[label] = 0
 
     # Total donations amount
-    total_donated = conn.execute(
-        """SELECT SUM(CAST(amount AS REAL))
-           FROM nonprofitclaw_donation
-           WHERE company_id=? AND status NOT IN ('refunded','cancelled')""",
-        (company_id,),
-    ).fetchone()[0]
+    total_q = (
+        Q.from_(_don)
+        .select(LiteralValue("SUM(CAST(amount AS REAL))"))
+        .where(_don.company_id == P())
+        .where(_don.status.notin(["refunded", "cancelled"]))
+    )
+    total_donated = conn.execute(total_q.get_sql(), (company_id,)).fetchone()[0]
 
     # Active grants
-    active_grants = conn.execute(
-        "SELECT COUNT(*) FROM nonprofitclaw_grant WHERE company_id=? AND status='active'",
-        (company_id,),
-    ).fetchone()[0]
+    ag_q = (
+        Q.from_(_grant)
+        .select(fn.Count("*"))
+        .where(_grant.company_id == P())
+        .where(_grant.status == "active")
+    )
+    active_grants = conn.execute(ag_q.get_sql(), (company_id,)).fetchone()[0]
 
     # Active campaigns
-    active_campaigns = conn.execute(
-        "SELECT COUNT(*) FROM nonprofitclaw_campaign WHERE company_id=? AND status='active'",
-        (company_id,),
-    ).fetchone()[0]
+    ac_q = (
+        Q.from_(_campaign)
+        .select(fn.Count("*"))
+        .where(_campaign.company_id == P())
+        .where(_campaign.status == "active")
+    )
+    active_campaigns = conn.execute(ac_q.get_sql(), (company_id,)).fetchone()[0]
 
     return ok({
         "module": "nonprofitclaw",
