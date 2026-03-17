@@ -15,7 +15,7 @@ try:
     from erpclaw_lib.gl_posting import insert_gl_entries
     from erpclaw_lib.query import (
         Q, P, Table, Field, fn, Order, LiteralValue,
-        insert_row, update_row, dynamic_update,
+        insert_row, update_row, dynamic_update, now,
     )
     HAS_GL = True
 except ImportError:
@@ -131,7 +131,7 @@ def update_grant(conn, args):
     if not data:
         return err("No fields to update")
 
-    data["updated_at"] = LiteralValue("datetime('now')")
+    data["updated_at"] = now()
     sql, params = dynamic_update("nonprofitclaw_grant", data, where={"id": grant_id})
     conn.execute(sql, params)
     conn.commit()
@@ -206,7 +206,7 @@ def get_grant(conn, args):
         .select(
             _ge.category,
             fn.Count("*").as_("count"),
-            LiteralValue("SUM(CAST(amount AS REAL))").as_("total"),
+            LiteralValue("SUM(CAST(amount AS NUMERIC))").as_("total"),
         )
         .where(_ge.grant_id == P())
         .where(_ge.status == "approved")
@@ -239,7 +239,7 @@ def activate_grant(conn, args):
 
     sql, params = dynamic_update("nonprofitclaw_grant",
         {"status": "active", "received_amount": str(received),
-         "remaining_amount": str(received), "updated_at": LiteralValue("datetime('now')")},
+         "remaining_amount": str(received), "updated_at": now()},
         where={"id": grant_id})
     conn.execute(sql, params)
 
@@ -248,8 +248,8 @@ def activate_grant(conn, args):
         ft = Table("nonprofitclaw_fund")
         fund_upd = (
             Q.update(ft)
-            .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS REAL) + ? AS TEXT)"))
-            .set(ft.updated_at, LiteralValue("datetime('now')"))
+            .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS NUMERIC) + ? AS TEXT)"))
+            .set(ft.updated_at, now())
             .where(ft.id == P())
         )
         conn.execute(fund_upd.get_sql(), (float(received), row["fund_id"]))
@@ -446,7 +446,7 @@ def approve_grant_expense(conn, args):
 
         spent_q = (
             Q.from_(_ge)
-            .select(LiteralValue("SUM(CAST(amount AS REAL))"))
+            .select(LiteralValue("SUM(CAST(amount AS NUMERIC))"))
             .where(_ge.grant_id == P())
             .where(_ge.status == "approved")
         )
@@ -460,7 +460,7 @@ def approve_grant_expense(conn, args):
 
         sql_g, params_g = dynamic_update("nonprofitclaw_grant",
             {"spent_amount": new_spent, "remaining_amount": new_remaining,
-             "updated_at": LiteralValue("datetime('now')")},
+             "updated_at": now()},
             where={"id": grant_id})
         conn.execute(sql_g, params_g)
 
@@ -552,7 +552,7 @@ def close_grant(conn, args):
 
     final_status = "completed" if row["status"] == "active" else "closed"
     sql, params = dynamic_update("nonprofitclaw_grant",
-        {"status": final_status, "updated_at": LiteralValue("datetime('now')")},
+        {"status": final_status, "updated_at": now()},
         where={"id": grant_id})
     conn.execute(sql, params)
     conn.commit()

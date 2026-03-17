@@ -118,7 +118,7 @@ def update_campaign(conn, args):
     if not data:
         return err("No fields to update")
 
-    data["updated_at"] = LiteralValue("datetime('now')")
+    data["updated_at"] = now()
     sql, params = dynamic_update("nonprofitclaw_campaign", data, where={"id": campaign_id})
     conn.execute(sql, params)
     conn.commit()
@@ -190,8 +190,8 @@ def get_campaign(conn, args):
         Q.from_(_pledge)
         .select(
             fn.Count("*").as_("pledge_count"),
-            LiteralValue("SUM(CAST(amount AS REAL))").as_("pledged_total"),
-            LiteralValue("SUM(CAST(fulfilled_amount AS REAL))").as_("fulfilled_total"),
+            LiteralValue("SUM(CAST(amount AS NUMERIC))").as_("pledged_total"),
+            LiteralValue("SUM(CAST(fulfilled_amount AS NUMERIC))").as_("fulfilled_total"),
         )
         .where(_pledge.campaign_id == P())
         .where(_pledge.status != "cancelled")
@@ -203,7 +203,7 @@ def get_campaign(conn, args):
         Q.from_(_don)
         .select(
             fn.Count("*").as_("donation_count"),
-            LiteralValue("SUM(CAST(amount AS REAL))").as_("donation_total"),
+            LiteralValue("SUM(CAST(amount AS NUMERIC))").as_("donation_total"),
         )
         .where(_don.campaign_id == P())
         .where(_don.status.notin(["refunded", "cancelled"]))
@@ -238,7 +238,7 @@ def activate_campaign(conn, args):
         return err(f"Campaign must be in 'draft' status to activate, currently '{row['status']}'")
 
     sql, params = dynamic_update("nonprofitclaw_campaign",
-        {"status": "active", "updated_at": LiteralValue("datetime('now')")},
+        {"status": "active", "updated_at": now()},
         where={"id": campaign_id})
     conn.execute(sql, params)
     conn.commit()
@@ -260,12 +260,12 @@ def close_campaign(conn, args):
 
     # Lapse active pledges
     sql_lapse, params_lapse = dynamic_update("nonprofitclaw_pledge",
-        {"status": "lapsed", "updated_at": LiteralValue("datetime('now')")},
+        {"status": "lapsed", "updated_at": now()},
         where={"campaign_id": campaign_id, "status": "active"})
     conn.execute(sql_lapse, params_lapse)
 
     sql_c, params_c = dynamic_update("nonprofitclaw_campaign",
-        {"status": "completed", "updated_at": LiteralValue("datetime('now')")},
+        {"status": "completed", "updated_at": now()},
         where={"id": campaign_id})
     conn.execute(sql_c, params_c)
     conn.commit()
@@ -473,7 +473,7 @@ def fulfill_pledge(conn, args):
     try:
         sql_f, params_f = dynamic_update("nonprofitclaw_pledge",
             {"fulfilled_amount": str(new_fulfilled), "status": new_status,
-             "updated_at": LiteralValue("datetime('now')")},
+             "updated_at": now()},
             where={"id": pledge_id})
         conn.execute(sql_f, params_f)
 
@@ -483,8 +483,8 @@ def fulfill_pledge(conn, args):
             ct = Table("nonprofitclaw_campaign")
             camp_upd = (
                 Q.update(ct)
-                .set(ct.raised_amount, LiteralValue("CAST(CAST(raised_amount AS REAL) + ? AS TEXT)"))
-                .set(ct.updated_at, LiteralValue("datetime('now')"))
+                .set(ct.raised_amount, LiteralValue("CAST(CAST(raised_amount AS NUMERIC) + ? AS TEXT)"))
+                .set(ct.updated_at, now())
                 .where(ct.id == P())
             )
             conn.execute(camp_upd.get_sql(), (float(amount), campaign_id))
@@ -517,7 +517,7 @@ def cancel_pledge(conn, args):
         return err(f"Cannot cancel pledge in '{row['status']}' status")
 
     sql, params = dynamic_update("nonprofitclaw_pledge",
-        {"status": "cancelled", "updated_at": LiteralValue("datetime('now')")},
+        {"status": "cancelled", "updated_at": now()},
         where={"id": pledge_id})
     conn.execute(sql, params)
     conn.commit()

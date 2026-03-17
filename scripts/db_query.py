@@ -43,9 +43,8 @@ def get_connection():
         err(f"Database not found at {DB_PATH}. Run erpclaw-setup initialize-database first.")
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
+    from erpclaw_lib.db import setup_pragmas
+    setup_pragmas(conn)
     return conn
 
 

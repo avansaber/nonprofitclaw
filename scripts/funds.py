@@ -102,7 +102,7 @@ def update_fund(conn, args):
     if not data:
         return err("No fields to update")
 
-    data["updated_at"] = LiteralValue("datetime('now')")
+    data["updated_at"] = now()
     sql, params = dynamic_update("nonprofitclaw_fund", data, where={"id": fund_id})
     conn.execute(sql, params)
     conn.commit()
@@ -302,8 +302,8 @@ def approve_fund_transfer(conn, args):
         ft = Table("nonprofitclaw_fund")
         debit_upd = (
             Q.update(ft)
-            .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS REAL) - ? AS TEXT)"))
-            .set(ft.updated_at, LiteralValue("datetime('now')"))
+            .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS NUMERIC) - ? AS TEXT)"))
+            .set(ft.updated_at, now())
             .where(ft.id == P())
         )
         conn.execute(debit_upd.get_sql(), (float(amount), from_fund_id))
@@ -311,8 +311,8 @@ def approve_fund_transfer(conn, args):
         # Credit destination fund
         credit_upd = (
             Q.update(ft)
-            .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS REAL) + ? AS TEXT)"))
-            .set(ft.updated_at, LiteralValue("datetime('now')"))
+            .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS NUMERIC) + ? AS TEXT)"))
+            .set(ft.updated_at, now())
             .where(ft.id == P())
         )
         conn.execute(credit_upd.get_sql(), (float(amount), to_fund_id))

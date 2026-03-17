@@ -24,7 +24,7 @@ try:
     from erpclaw_lib.gl_posting import insert_gl_entries, reverse_gl_entries
     from erpclaw_lib.query import (
         Q, P, Table, Field, fn, Order, LiteralValue,
-        insert_row, update_row, dynamic_update,
+        insert_row, update_row, dynamic_update, now,
     )
     HAS_GL = True
 except ImportError:
@@ -150,7 +150,7 @@ def update_donor(conn, args):
         ext_data["is_active"] = int(is_active)
 
     if ext_data:
-        ext_data["updated_at"] = LiteralValue("datetime('now')")
+        ext_data["updated_at"] = now()
         sql, params = dynamic_update("nonprofitclaw_donor_ext", ext_data, where={"id": donor_id})
         conn.execute(sql, params)
         conn.commit()
@@ -264,7 +264,7 @@ def donor_giving_history(conn, args):
 
     total_q = (
         Q.from_(_don)
-        .select(LiteralValue("SUM(CAST(amount AS REAL))"))
+        .select(LiteralValue("SUM(CAST(amount AS NUMERIC))"))
         .where(_don.donor_id == P())
         .where(_don.status.notin(["refunded", "cancelled"]))
     )
@@ -311,7 +311,7 @@ def merge_donors(conn, args):
         # Recalculate target donor stats
         stats_q = (
             Q.from_(_don)
-            .select(fn.Count("*").as_("cnt"), LiteralValue("SUM(CAST(amount AS REAL))").as_("total"))
+            .select(fn.Count("*").as_("cnt"), LiteralValue("SUM(CAST(amount AS NUMERIC))").as_("total"))
             .where(_don.donor_id == P())
             .where(_don.status.notin(["refunded", "cancelled"]))
         )
@@ -341,7 +341,7 @@ def merge_donors(conn, args):
             "donation_count": new_count,
             "last_donation_date": last_date[0],
             "first_donation_date": first_date[0],
-            "updated_at": LiteralValue("datetime('now')"),
+            "updated_at": now(),
         }
         sql_t, params_t = dynamic_update("nonprofitclaw_donor_ext", upd_target, where={"id": target_id})
         conn.execute(sql_t, params_t)
@@ -483,7 +483,7 @@ def add_donation(conn, args):
         # Update donor ext stats
         stats_q = (
             Q.from_(_don)
-            .select(fn.Count("*").as_("cnt"), LiteralValue("SUM(CAST(amount AS REAL))").as_("total"))
+            .select(fn.Count("*").as_("cnt"), LiteralValue("SUM(CAST(amount AS NUMERIC))").as_("total"))
             .where(_don.donor_id == P())
             .where(_don.status.notin(["refunded", "cancelled"]))
         )
@@ -504,7 +504,7 @@ def add_donation(conn, args):
             "total_donated": new_total,
             "donation_count": new_count,
             "last_donation_date": donation_date,
-            "updated_at": LiteralValue("datetime('now')"),
+            "updated_at": now(),
         }
         # Use COALESCE for first_donation_date to preserve existing value
         t = Table("nonprofitclaw_donor_ext")
@@ -514,7 +514,7 @@ def add_donation(conn, args):
             .set(t.donation_count, P())
             .set(t.last_donation_date, P())
             .set(t.first_donation_date, LiteralValue("COALESCE(first_donation_date, ?)"))
-            .set(t.updated_at, LiteralValue("datetime('now')"))
+            .set(t.updated_at, now())
             .where(t.id == P())
         )
         conn.execute(upd_q.get_sql(), (new_total, new_count, donation_date, first_date[0], donor_id))
@@ -524,8 +524,8 @@ def add_donation(conn, args):
             ft = Table("nonprofitclaw_fund")
             fund_upd = (
                 Q.update(ft)
-                .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS REAL) + ? AS TEXT)"))
-                .set(ft.updated_at, LiteralValue("datetime('now')"))
+                .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS NUMERIC) + ? AS TEXT)"))
+                .set(ft.updated_at, now())
                 .where(ft.id == P())
             )
             conn.execute(fund_upd.get_sql(), (float(amount), fund_id))
@@ -535,9 +535,9 @@ def add_donation(conn, args):
             ct = Table("nonprofitclaw_campaign")
             camp_upd = (
                 Q.update(ct)
-                .set(ct.raised_amount, LiteralValue("CAST(CAST(raised_amount AS REAL) + ? AS TEXT)"))
+                .set(ct.raised_amount, LiteralValue("CAST(CAST(raised_amount AS NUMERIC) + ? AS TEXT)"))
                 .set(ct.donor_count, LiteralValue("donor_count + 1"))
-                .set(ct.updated_at, LiteralValue("datetime('now')"))
+                .set(ct.updated_at, now())
                 .where(ct.id == P())
             )
             conn.execute(camp_upd.get_sql(), (float(amount), campaign_id))
@@ -586,7 +586,7 @@ def update_donation(conn, args):
     if not data:
         return err("No fields to update")
 
-    data["updated_at"] = LiteralValue("datetime('now')")
+    data["updated_at"] = now()
     sql, params = dynamic_update("nonprofitclaw_donation", data, where={"id": donation_id})
     conn.execute(sql, params)
     conn.commit()
@@ -707,7 +707,7 @@ def refund_donation(conn, args):
     gl_reversal_ids = None
     try:
         sql_ref, params_ref = dynamic_update("nonprofitclaw_donation",
-            {"status": "refunded", "updated_at": LiteralValue("datetime('now')")},
+            {"status": "refunded", "updated_at": now()},
             where={"id": donation_id})
         conn.execute(sql_ref, params_ref)
 
@@ -728,7 +728,7 @@ def refund_donation(conn, args):
         # Update donor stats
         stats_q = (
             Q.from_(_don)
-            .select(fn.Count("*").as_("cnt"), LiteralValue("SUM(CAST(amount AS REAL))").as_("total"))
+            .select(fn.Count("*").as_("cnt"), LiteralValue("SUM(CAST(amount AS NUMERIC))").as_("total"))
             .where(_don.donor_id == P())
             .where(_don.status.notin(["refunded", "cancelled"]))
         )
@@ -749,7 +749,7 @@ def refund_donation(conn, args):
             "total_donated": new_total,
             "donation_count": new_count,
             "last_donation_date": last_date[0],
-            "updated_at": LiteralValue("datetime('now')"),
+            "updated_at": now(),
         }
         sql_d, params_d = dynamic_update("nonprofitclaw_donor_ext", upd_donor, where={"id": donor_id})
         conn.execute(sql_d, params_d)
@@ -759,8 +759,8 @@ def refund_donation(conn, args):
             ft = Table("nonprofitclaw_fund")
             fund_upd = (
                 Q.update(ft)
-                .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS REAL) - ? AS TEXT)"))
-                .set(ft.updated_at, LiteralValue("datetime('now')"))
+                .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS NUMERIC) - ? AS TEXT)"))
+                .set(ft.updated_at, now())
                 .where(ft.id == P())
             )
             conn.execute(fund_upd.get_sql(), (float(amount), fund_id))
@@ -770,9 +770,9 @@ def refund_donation(conn, args):
             ct = Table("nonprofitclaw_campaign")
             camp_upd = (
                 Q.update(ct)
-                .set(ct.raised_amount, LiteralValue("CAST(CAST(raised_amount AS REAL) - ? AS TEXT)"))
+                .set(ct.raised_amount, LiteralValue("CAST(CAST(raised_amount AS NUMERIC) - ? AS TEXT)"))
                 .set(ct.donor_count, LiteralValue("MAX(donor_count - 1, 0)"))
-                .set(ct.updated_at, LiteralValue("datetime('now')"))
+                .set(ct.updated_at, now())
                 .where(ct.id == P())
             )
             conn.execute(camp_upd.get_sql(), (float(amount), campaign_id))

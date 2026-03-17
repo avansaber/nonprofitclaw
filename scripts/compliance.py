@@ -3,7 +3,7 @@
 import os
 import sys
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
 sys.path.insert(0, os.path.expanduser("~/.openclaw/erpclaw/lib"))
@@ -107,7 +107,7 @@ def generate_tax_receipt(conn, args):
         # Annual summary receipt — aggregate all deductible donations for the year
         total_q = (
             Q.from_(_don)
-            .select(LiteralValue("SUM(CAST(amount AS REAL))").as_("total"))
+            .select(LiteralValue("SUM(CAST(amount AS NUMERIC))").as_("total"))
             .where(_don.donor_id == P())
             .where(_don.company_id == P())
             .where(_don.tax_deductible == 1)
@@ -240,8 +240,8 @@ def donor_summary(conn, args):
         Q.from_(_don)
         .select(
             fn.Count("*").as_("total_donations"),
-            LiteralValue("SUM(CAST(amount AS REAL))").as_("total_amount"),
-            LiteralValue("AVG(CAST(amount AS REAL))").as_("avg_donation"),
+            LiteralValue("SUM(CAST(amount AS NUMERIC))").as_("total_amount"),
+            LiteralValue("AVG(CAST(amount AS NUMERIC))").as_("avg_donation"),
         )
         .where(_don.company_id == P())
         .where(_don.status.notin(["refunded", "cancelled"]))
@@ -269,26 +269,27 @@ def donor_summary(conn, args):
         )
         .where(_de.company_id == P())
         .where(_de.is_active == 1)
-        .orderby(LiteralValue("CAST(\"nonprofitclaw_donor_ext\".\"total_donated\" AS REAL)"), order=Order.desc)
+        .orderby(LiteralValue("CAST(\"nonprofitclaw_donor_ext\".\"total_donated\" AS NUMERIC)"), order=Order.desc)
         .limit(10)
     )
     top_donors = conn.execute(top_q.get_sql(), (company_id,)).fetchall()
 
     # Monthly trend (last 12 months)
+    cutoff_12m = (date.today() - timedelta(days=365)).strftime('%Y-%m-%d')
     trend_q = (
         Q.from_(_don)
         .select(
             LiteralValue("strftime('%Y-%m', donation_date)").as_("month"),
             fn.Count("*").as_("count"),
-            LiteralValue("SUM(CAST(amount AS REAL))").as_("total"),
+            LiteralValue("SUM(CAST(amount AS NUMERIC))").as_("total"),
         )
         .where(_don.company_id == P())
         .where(_don.status.notin(["refunded", "cancelled"]))
-        .where(_don.donation_date >= LiteralValue("date('now', '-12 months')"))
+        .where(_don.donation_date >= P())
         .groupby(LiteralValue("month"))
         .orderby(LiteralValue("month"))
     )
-    monthly_trend = conn.execute(trend_q.get_sql(), (company_id,)).fetchall()
+    monthly_trend = conn.execute(trend_q.get_sql(), (company_id, cutoff_12m)).fetchall()
 
     trend = []
     for m in monthly_trend:
@@ -350,7 +351,7 @@ def module_status(conn, args):
     # Total donations amount
     total_q = (
         Q.from_(_don)
-        .select(LiteralValue("SUM(CAST(amount AS REAL))"))
+        .select(LiteralValue("SUM(CAST(amount AS NUMERIC))"))
         .where(_don.company_id == P())
         .where(_don.status.notin(["refunded", "cancelled"]))
     )

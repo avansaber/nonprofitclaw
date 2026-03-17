@@ -14,7 +14,8 @@ DEFAULT_DB_PATH = os.path.expanduser("~/.openclaw/erpclaw/data.sqlite")
 
 def create_nonprofitclaw_tables(db_path):
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys=ON")
+    from erpclaw_lib.db import setup_pragmas
+    setup_pragmas(conn)
 
     tables = [r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'"
@@ -46,8 +47,8 @@ def create_nonprofitclaw_tables(db_path):
             notes           TEXT,
             is_active       INTEGER DEFAULT 1,
             company_id      TEXT NOT NULL REFERENCES company(id),
-            created_at      TEXT DEFAULT (datetime('now')),
-            updated_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_donor_ext_company ON nonprofitclaw_donor_ext(company_id);
@@ -61,7 +62,7 @@ def create_nonprofitclaw_tables(db_path):
             donor_id        TEXT NOT NULL REFERENCES nonprofitclaw_donor_ext(id) ON DELETE RESTRICT,
             fund_id         TEXT REFERENCES nonprofitclaw_fund(id) ON DELETE RESTRICT,
             campaign_id     TEXT REFERENCES nonprofitclaw_campaign(id) ON DELETE RESTRICT,
-            donation_date   TEXT NOT NULL DEFAULT (date('now')),
+            donation_date   TEXT NOT NULL DEFAULT CURRENT_DATE,
             amount          TEXT NOT NULL DEFAULT '0',
             payment_method  TEXT NOT NULL DEFAULT 'check'
                             CHECK(payment_method IN ('cash','check','credit_card','bank_transfer','online','in_kind','stock','crypto','other')),
@@ -77,8 +78,8 @@ def create_nonprofitclaw_tables(db_path):
             status          TEXT NOT NULL DEFAULT 'received'
                             CHECK(status IN ('pledged','received','deposited','refunded','cancelled')),
             company_id      TEXT NOT NULL REFERENCES company(id) ON DELETE RESTRICT,
-            created_at      TEXT DEFAULT (datetime('now')),
-            updated_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_donation_donor ON nonprofitclaw_donation(donor_id);
@@ -99,8 +100,8 @@ def create_nonprofitclaw_tables(db_path):
             end_date        TEXT,
             is_active       INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
             company_id      TEXT NOT NULL REFERENCES company(id) ON DELETE RESTRICT,
-            created_at      TEXT DEFAULT (datetime('now')),
-            updated_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_fund_company ON nonprofitclaw_fund(company_id);
@@ -112,13 +113,13 @@ def create_nonprofitclaw_tables(db_path):
             from_fund_id    TEXT NOT NULL REFERENCES nonprofitclaw_fund(id) ON DELETE RESTRICT,
             to_fund_id      TEXT NOT NULL REFERENCES nonprofitclaw_fund(id) ON DELETE RESTRICT,
             amount          TEXT NOT NULL DEFAULT '0',
-            transfer_date   TEXT NOT NULL DEFAULT (date('now')),
+            transfer_date   TEXT NOT NULL DEFAULT CURRENT_DATE,
             reason          TEXT,
             approved_by     TEXT,
             status          TEXT NOT NULL DEFAULT 'draft'
                             CHECK(status IN ('draft','approved','completed','cancelled')),
             company_id      TEXT NOT NULL REFERENCES company(id) ON DELETE RESTRICT,
-            created_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_ft_company ON nonprofitclaw_fund_transfer(company_id);
@@ -146,8 +147,8 @@ def create_nonprofitclaw_tables(db_path):
                             CHECK(status IN ('applied','awarded','active','completed','closed','rejected')),
             notes           TEXT,
             company_id      TEXT NOT NULL REFERENCES company(id) ON DELETE RESTRICT,
-            created_at      TEXT DEFAULT (datetime('now')),
-            updated_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_grant_company ON nonprofitclaw_grant(company_id);
@@ -157,7 +158,7 @@ def create_nonprofitclaw_tables(db_path):
             id              TEXT PRIMARY KEY,
             naming_series   TEXT,
             grant_id        TEXT NOT NULL REFERENCES nonprofitclaw_grant(id) ON DELETE RESTRICT,
-            expense_date    TEXT NOT NULL DEFAULT (date('now')),
+            expense_date    TEXT NOT NULL DEFAULT CURRENT_DATE,
             amount          TEXT NOT NULL DEFAULT '0',
             category        TEXT NOT NULL DEFAULT 'program'
                             CHECK(category IN ('program','personnel','overhead','travel','equipment','supplies','other')),
@@ -167,7 +168,7 @@ def create_nonprofitclaw_tables(db_path):
             status          TEXT NOT NULL DEFAULT 'draft'
                             CHECK(status IN ('draft','submitted','approved','rejected')),
             company_id      TEXT NOT NULL REFERENCES company(id) ON DELETE RESTRICT,
-            created_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_gexp_grant ON nonprofitclaw_grant_expense(grant_id);
@@ -186,8 +187,8 @@ def create_nonprofitclaw_tables(db_path):
             outcome_metrics TEXT,
             is_active       INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
             company_id      TEXT NOT NULL REFERENCES company(id) ON DELETE RESTRICT,
-            created_at      TEXT DEFAULT (datetime('now')),
-            updated_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_program_company ON nonprofitclaw_program(company_id);
@@ -205,8 +206,8 @@ def create_nonprofitclaw_tables(db_path):
             start_date      TEXT,
             is_active       INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
             company_id      TEXT NOT NULL REFERENCES company(id) ON DELETE RESTRICT,
-            created_at      TEXT DEFAULT (datetime('now')),
-            updated_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_vol_company ON nonprofitclaw_volunteer(company_id);
@@ -216,13 +217,13 @@ def create_nonprofitclaw_tables(db_path):
             naming_series   TEXT,
             volunteer_id    TEXT NOT NULL REFERENCES nonprofitclaw_volunteer(id) ON DELETE RESTRICT,
             program_id      TEXT REFERENCES nonprofitclaw_program(id) ON DELETE RESTRICT,
-            shift_date      TEXT NOT NULL DEFAULT (date('now')),
+            shift_date      TEXT NOT NULL DEFAULT CURRENT_DATE,
             hours           TEXT NOT NULL DEFAULT '0',
             description     TEXT,
             status          TEXT NOT NULL DEFAULT 'scheduled'
                             CHECK(status IN ('scheduled','completed','cancelled','no_show')),
             company_id      TEXT NOT NULL REFERENCES company(id) ON DELETE RESTRICT,
-            created_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_vshift_vol ON nonprofitclaw_volunteer_shift(volunteer_id);
@@ -234,7 +235,7 @@ def create_nonprofitclaw_tables(db_path):
             donor_id        TEXT NOT NULL REFERENCES nonprofitclaw_donor_ext(id) ON DELETE RESTRICT,
             campaign_id     TEXT REFERENCES nonprofitclaw_campaign(id) ON DELETE RESTRICT,
             fund_id         TEXT REFERENCES nonprofitclaw_fund(id) ON DELETE RESTRICT,
-            pledge_date     TEXT NOT NULL DEFAULT (date('now')),
+            pledge_date     TEXT NOT NULL DEFAULT CURRENT_DATE,
             amount          TEXT NOT NULL DEFAULT '0',
             fulfilled_amount TEXT NOT NULL DEFAULT '0',
             frequency       TEXT NOT NULL DEFAULT 'one_time'
@@ -245,8 +246,8 @@ def create_nonprofitclaw_tables(db_path):
             status          TEXT NOT NULL DEFAULT 'active'
                             CHECK(status IN ('active','fulfilled','partially_fulfilled','cancelled','lapsed')),
             company_id      TEXT NOT NULL REFERENCES company(id) ON DELETE RESTRICT,
-            created_at      TEXT DEFAULT (datetime('now')),
-            updated_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_pledge_donor ON nonprofitclaw_pledge(donor_id);
@@ -266,8 +267,8 @@ def create_nonprofitclaw_tables(db_path):
             status          TEXT NOT NULL DEFAULT 'draft'
                             CHECK(status IN ('draft','active','completed','cancelled')),
             company_id      TEXT NOT NULL REFERENCES company(id) ON DELETE RESTRICT,
-            created_at      TEXT DEFAULT (datetime('now')),
-            updated_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_campaign_company ON nonprofitclaw_campaign(company_id);
@@ -278,7 +279,7 @@ def create_nonprofitclaw_tables(db_path):
             naming_series   TEXT,
             donor_id        TEXT NOT NULL REFERENCES nonprofitclaw_donor_ext(id) ON DELETE RESTRICT,
             donation_id     TEXT REFERENCES nonprofitclaw_donation(id) ON DELETE RESTRICT,
-            receipt_date    TEXT NOT NULL DEFAULT (date('now')),
+            receipt_date    TEXT NOT NULL DEFAULT CURRENT_DATE,
             amount          TEXT NOT NULL DEFAULT '0',
             tax_year        TEXT NOT NULL,
             receipt_type    TEXT NOT NULL DEFAULT 'single'
@@ -286,7 +287,7 @@ def create_nonprofitclaw_tables(db_path):
             sent_date       TEXT,
             sent_method     TEXT CHECK(sent_method IN ('email','mail','both',NULL)),
             company_id      TEXT NOT NULL REFERENCES company(id) ON DELETE RESTRICT,
-            created_at      TEXT DEFAULT (datetime('now'))
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_nonprofitclaw_trec_donor ON nonprofitclaw_tax_receipt(donor_id);
