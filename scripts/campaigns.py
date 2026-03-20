@@ -12,7 +12,7 @@ from erpclaw_lib.response import ok, err
 from erpclaw_lib.audit import audit
 from erpclaw_lib.query import (
     Q, P, Table, Field, fn, Order, LiteralValue,
-    insert_row, update_row, dynamic_update,
+    insert_row, update_row, dynamic_update, now,
 )
 
 SKILL = "nonprofitclaw"
