@@ -37,4 +37,4 @@ The bot will install NonprofitClaw and guide you through setting up funds, regis
 
 ## License
 
-MIT License -- Copyright (c) 2026 AvanSaber / Nikhil Jathar
+GNU General Public License v3 -- Copyright (c) 2026 AvanSaber / Nikhil Jathar

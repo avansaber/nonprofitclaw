@@ -306,7 +306,7 @@ def approve_fund_transfer(conn, args):
             .set(ft.updated_at, now())
             .where(ft.id == P())
         )
-        conn.execute(debit_upd.get_sql(), (float(amount), from_fund_id))
+        conn.execute(debit_upd.get_sql(), (str(amount), from_fund_id))
 
         # Credit destination fund
         credit_upd = (
@@ -315,7 +315,7 @@ def approve_fund_transfer(conn, args):
             .set(ft.updated_at, now())
             .where(ft.id == P())
         )
-        conn.execute(credit_upd.get_sql(), (float(amount), to_fund_id))
+        conn.execute(credit_upd.get_sql(), (str(amount), to_fund_id))
 
         # Mark transfer as completed
         sql_c, params_c = dynamic_update("nonprofitclaw_fund_transfer",

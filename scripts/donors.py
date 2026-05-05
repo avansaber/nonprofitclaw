@@ -528,7 +528,7 @@ def add_donation(conn, args):
                 .set(ft.updated_at, now())
                 .where(ft.id == P())
             )
-            conn.execute(fund_upd.get_sql(), (float(amount), fund_id))
+            conn.execute(fund_upd.get_sql(), (str(amount), fund_id))
 
         # Update campaign raised_amount if applicable
         if campaign_id:
@@ -540,7 +540,7 @@ def add_donation(conn, args):
                 .set(ct.updated_at, now())
                 .where(ct.id == P())
             )
-            conn.execute(camp_upd.get_sql(), (float(amount), campaign_id))
+            conn.execute(camp_upd.get_sql(), (str(amount), campaign_id))
 
         conn.commit()
     except Exception as e:
@@ -763,7 +763,7 @@ def refund_donation(conn, args):
                 .set(ft.updated_at, now())
                 .where(ft.id == P())
             )
-            conn.execute(fund_upd.get_sql(), (float(amount), fund_id))
+            conn.execute(fund_upd.get_sql(), (str(amount), fund_id))
 
         # Reverse campaign stats if applicable
         if campaign_id:
@@ -775,7 +775,7 @@ def refund_donation(conn, args):
                 .set(ct.updated_at, now())
                 .where(ct.id == P())
             )
-            conn.execute(camp_upd.get_sql(), (float(amount), campaign_id))
+            conn.execute(camp_upd.get_sql(), (str(amount), campaign_id))
 
         conn.commit()
     except Exception as e:
