@@ -487,7 +487,7 @@ def fulfill_pledge(conn, args):
                 .set(ct.updated_at, now())
                 .where(ct.id == P())
             )
-            conn.execute(camp_upd.get_sql(), (float(amount), campaign_id))
+            conn.execute(camp_upd.get_sql(), (str(amount), campaign_id))
 
         conn.commit()
     except Exception as e:
