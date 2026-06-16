@@ -9,7 +9,7 @@ import os
 import sqlite3
 import sys
 
-sys.path.insert(0, os.path.expanduser("~/.openclaw/erpclaw/lib"))
+sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from erpclaw_lib.response import err
@@ -24,7 +24,7 @@ from campaigns import ACTIONS as CAMPAIGNS_ACTIONS
 from compliance import ACTIONS as COMPLIANCE_ACTIONS
 
 SKILL = "nonprofitclaw"
-DB_PATH = os.path.expanduser("~/.openclaw/erpclaw/data.sqlite")
+DB_PATH = os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "data.sqlite")
 REQUIRED_TABLES = ["company", "customer", "nonprofitclaw_donor_ext"]
 
 # Merge all domain action dicts
