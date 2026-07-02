@@ -1,6 +1,6 @@
 # NonprofitClaw
 
-Non-profit management for [ERPClaw](https://github.com/avansaber/erpclaw). Donor management, fund accounting, grant tracking, volunteer coordination, fundraising campaigns, and compliance. <!-- SYNC:value:module.nonprofitclaw.actions -->57<!-- /SYNC --> actions across 8 domains.
+Non-profit management for [ERPClaw](https://github.com/avansaber/erpclaw). Donor management, fund accounting, grant tracking, volunteer coordination, fundraising campaigns, and compliance. <!-- SYNC:value:module.nonprofitclaw.actions -->58<!-- /SYNC --> actions across 8 domains.
 
 ## Features
 
