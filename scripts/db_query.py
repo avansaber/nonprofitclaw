@@ -6,12 +6,12 @@ Routes all --action calls to the appropriate domain handler.
 """
 import argparse
 import os
-import sqlite3
 import sys
 
 sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from erpclaw_lib.db import get_connection
 from erpclaw_lib.response import err
 from erpclaw_lib.args import SafeArgumentParser
 
@@ -24,7 +24,6 @@ from campaigns import ACTIONS as CAMPAIGNS_ACTIONS
 from compliance import ACTIONS as COMPLIANCE_ACTIONS
 
 SKILL = "nonprofitclaw"
-DB_PATH = os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "data.sqlite")
 REQUIRED_TABLES = ["company", "customer", "nonprofitclaw_donor_ext"]
 
 # Merge all domain action dicts
@@ -36,16 +35,6 @@ ACTIONS.update(PROGRAMS_ACTIONS)
 ACTIONS.update(VOLUNTEERS_ACTIONS)
 ACTIONS.update(CAMPAIGNS_ACTIONS)
 ACTIONS.update(COMPLIANCE_ACTIONS)
-
-
-def get_connection():
-    if not os.path.exists(DB_PATH):
-        err(f"Database not found at {DB_PATH}. Run erpclaw-setup initialize-database first.")
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    from erpclaw_lib.db import setup_pragmas
-    setup_pragmas(conn)
-    return conn
 
 
 def check_tables(conn):

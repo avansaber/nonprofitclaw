@@ -1,6 +1,6 @@
 ---
 name: nonprofitclaw
-version: 1.0.0
+version: 1.0.1
 description: Non-Profit Management -- 57 actions across 7 domains. Donor management, donations, pledges, fund accounting, grants, volunteers, campaigns, tax receipts, and compliance.
 author: AvanSaber
 homepage: https://github.com/avansaber/nonprofitclaw
