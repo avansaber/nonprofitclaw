@@ -6,13 +6,15 @@ import uuid
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 
-sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
+import importlib.util
+if importlib.util.find_spec("erpclaw_lib") is None:
+    sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
 from erpclaw_lib.naming import get_next_name
 from erpclaw_lib.response import ok, err
 from erpclaw_lib.audit import audit
 from erpclaw_lib.query import (
     Q, P, Table, Field, fn, Order, LiteralValue,
-    insert_row, update_row, dynamic_update,
+    insert_row, update_row, dynamic_update, now as sql_now,
 )
 
 SKILL = "nonprofitclaw"
@@ -95,7 +97,7 @@ def update_volunteer(conn, args):
     if not data:
         return err("No fields to update")
 
-    data["updated_at"] = LiteralValue("datetime('now')")
+    data["updated_at"] = sql_now()
     sql, params = dynamic_update("nonprofitclaw_volunteer", data, where={"id": volunteer_id})
     conn.execute(sql, params)
     conn.commit()
@@ -337,7 +339,7 @@ def complete_volunteer_shift(conn, args):
         upd_vol = {
             "total_hours": new_total,
             "shift_count": new_count,
-            "updated_at": LiteralValue("datetime('now')"),
+            "updated_at": sql_now(),
         }
         sql_v, params_v = dynamic_update("nonprofitclaw_volunteer", upd_vol, where={"id": volunteer_id})
         conn.execute(sql_v, params_v)

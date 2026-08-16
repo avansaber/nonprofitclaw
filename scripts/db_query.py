@@ -8,7 +8,9 @@ import argparse
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
+import importlib.util
+if importlib.util.find_spec("erpclaw_lib") is None:
+    sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from erpclaw_lib.db import get_connection

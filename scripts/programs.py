@@ -5,13 +5,15 @@ import sys
 import uuid
 from decimal import Decimal, ROUND_HALF_UP
 
-sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
+import importlib.util
+if importlib.util.find_spec("erpclaw_lib") is None:
+    sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
 from erpclaw_lib.naming import get_next_name
 from erpclaw_lib.response import ok, err
 from erpclaw_lib.audit import audit
 from erpclaw_lib.query import (
     Q, P, Table, Field, fn, Order, LiteralValue,
-    insert_row, update_row, dynamic_update,
+    insert_row, update_row, dynamic_update, now as sql_now,
 )
 
 SKILL = "nonprofitclaw"
@@ -124,7 +126,7 @@ def update_program(conn, args):
     if not data:
         return err("No fields to update")
 
-    data["updated_at"] = LiteralValue("datetime('now')")
+    data["updated_at"] = sql_now()
     sql, params = dynamic_update("nonprofitclaw_program", data, where={"id": program_id})
     conn.execute(sql, params)
     conn.commit()
@@ -243,7 +245,7 @@ def update_program_outcomes(conn, args):
     if not data:
         return err("Provide --beneficiary-count and/or --outcome-metrics")
 
-    data["updated_at"] = LiteralValue("datetime('now')")
+    data["updated_at"] = sql_now()
     sql, params = dynamic_update("nonprofitclaw_program", data, where={"id": program_id})
     conn.execute(sql, params)
     conn.commit()

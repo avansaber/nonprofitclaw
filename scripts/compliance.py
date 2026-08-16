@@ -6,13 +6,15 @@ import uuid
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
-sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
+import importlib.util
+if importlib.util.find_spec("erpclaw_lib") is None:
+    sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
 from erpclaw_lib.naming import get_next_name
 from erpclaw_lib.response import ok, err
 from erpclaw_lib.audit import audit
 from erpclaw_lib.query import (
     Q, P, Table, Field, fn, Order, LiteralValue,
-    insert_row, update_row, dynamic_update,
+    insert_row, update_row, dynamic_update, date_format as sql_date_format, now as sql_now,
 )
 
 SKILL = "nonprofitclaw"
@@ -112,7 +114,7 @@ def generate_tax_receipt(conn, args):
             .where(_don.company_id == P())
             .where(_don.tax_deductible == 1)
             .where(_don.status.notin(["refunded", "cancelled"]))
-            .where(LiteralValue("strftime('%Y', donation_date)") == P())
+            .where(sql_date_format("donation_date", "%Y") == P())
         )
         total_row = conn.execute(total_q.get_sql(), (donor_id, company_id, tax_year)).fetchone()
 
@@ -142,7 +144,7 @@ def generate_tax_receipt(conn, args):
     # Mark donation as receipt_sent if single
     if donation_id:
         sql_u, params_u = dynamic_update("nonprofitclaw_donation",
-            {"receipt_sent": 1, "updated_at": LiteralValue("datetime('now')")},
+            {"receipt_sent": 1, "updated_at": sql_now()},
             where={"id": donation_id})
         conn.execute(sql_u, params_u)
 
@@ -279,7 +281,7 @@ def donor_summary(conn, args):
     trend_q = (
         Q.from_(_don)
         .select(
-            LiteralValue("strftime('%Y-%m', donation_date)").as_("month"),
+            sql_date_format("donation_date", "%Y-%m").as_("month"),
             fn.Count("*").as_("count"),
             LiteralValue("SUM(CAST(amount AS NUMERIC))").as_("total"),
         )
