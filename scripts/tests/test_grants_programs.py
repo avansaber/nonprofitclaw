@@ -24,7 +24,8 @@ import pytest
 from decimal import Decimal
 from nonprofit_helpers import (
     call_action, ns, is_error, is_ok, load_db_query,
-    seed_grant, seed_fund, seed_program,
+    seed_company, seed_grant, seed_fund, seed_naming_series, seed_program,
+    snapshot_tables,
 )
 
 mod = load_db_query()
@@ -258,9 +259,9 @@ class TestApproveGrantExpense:
         # Approve it
         result = call_action(grants_mod.approve_grant_expense, conn, ns(
             id=expense_id,
-            expense_account_id=None,
-            cash_account_id=None,
-            cost_center_id=None,
+            expense_account_id=env["expense_acct"],
+            cash_account_id=env["cash_acct"],
+            cost_center_id=env["cc_id"],
         ))
         assert is_ok(result), result
         assert result["approved"] is True
@@ -290,11 +291,67 @@ class TestApproveGrantExpense:
             cost_center_id=None,
         ))
         assert is_error(result)
+        assert result["message"] == (
+            "Expense amount (999.00) exceeds grant remaining (500.00)")
 
 
 class TestListGrantExpenses:
+    """Behaviour of nonprofit-list-grant-expenses, read back from the database.
+
+    The expenses below are created through nonprofit-add-grant-expense, then
+    the stored nonprofitclaw_grant_expense rows are read back and compared
+    field-for-field with what the list response returns, including the grant
+    name join and every filter.
+
+    nonprofit-list-grant-expenses never posts to the general ledger (no
+    gl_entry write exists in grants.py for the list path), so this asserts
+    stored rows, never ledger legs; a later reader must not add a
+    balanced-legs assertion here.
+    """
+
+    def _make_expense(self, conn, env, grant_id, amount, category,
+                      expense_date, description):
+        import grants as grants_mod
+        result = call_action(grants_mod.add_grant_expense, conn, ns(
+            company_id=env["company_id"],
+            grant_id=grant_id,
+            amount=amount,
+            category=category,
+            description=description,
+            expense_date=expense_date,
+            receipt_reference=None,
+        ))
+        assert is_ok(result), result
+        return result["id"]
+
     def test_list_expenses(self, conn, env):
         import grants as grants_mod
+        first_grant = seed_grant(conn, env["company_id"], "Library Grant",
+                                 grantor_name="City Trust", amount="20000.00",
+                                 status="active")
+        second_grant = seed_grant(conn, env["company_id"], "Garden Grant",
+                                  grantor_name="Green Fund", amount="8000.00",
+                                  status="active")
+        first_id = self._make_expense(conn, env, first_grant, "1500.10",
+                                      "program", "2026-03-01", "Books")
+        second_id = self._make_expense(conn, env, second_grant, "250.25",
+                                       "travel", "2026-04-15", "Site visit")
+
+        stored = {
+            row["id"]: dict(row) for row in conn.execute(
+                "SELECT * FROM nonprofitclaw_grant_expense").fetchall()
+        }
+        assert stored[first_id]["amount"] == "1500.10"
+        assert stored[second_id]["amount"] == "250.25"
+        assert stored[first_id]["grant_id"] == first_grant
+        assert stored[second_id]["grant_id"] == second_grant
+        assert stored[first_id]["category"] == "program"
+        assert stored[second_id]["category"] == "travel"
+        assert stored[first_id]["expense_date"] == "2026-03-01"
+        assert stored[second_id]["expense_date"] == "2026-04-15"
+        assert stored[first_id]["description"] == "Books"
+        assert stored[first_id]["status"] == "draft"
+
         result = call_action(grants_mod.list_grant_expenses, conn, ns(
             company_id=env["company_id"],
             grant_id=None, status=None, category=None,
@@ -302,7 +359,112 @@ class TestListGrantExpenses:
             limit="50", offset="0",
         ))
         assert is_ok(result), result
-        assert "grant_expenses" in result
+        assert result["total"] == 2
+        listed = {entry["id"]: entry for entry in result["grant_expenses"]}
+        assert set(listed) == {first_id, second_id}
+        for expense_id, row in stored.items():
+            entry = listed[expense_id]
+            assert entry["amount"] == row["amount"]
+            assert Decimal(entry["amount"]) == Decimal(row["amount"])
+            assert entry["grant_id"] == row["grant_id"]
+            assert entry["category"] == row["category"]
+            assert entry["expense_date"] == row["expense_date"]
+            assert entry["description"] == row["description"]
+            assert entry["status"] == row["status"]
+            assert entry["naming_series"] == row["naming_series"]
+        assert listed[first_id]["grant_name"] == "Library Grant"
+        assert listed[second_id]["grant_name"] == "Garden Grant"
+
+        by_grant = call_action(grants_mod.list_grant_expenses, conn, ns(
+            company_id=env["company_id"],
+            grant_id=first_grant, status=None, category=None,
+            from_date=None, to_date=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(by_grant), by_grant
+        assert (by_grant["total"],
+                [entry["id"] for entry in by_grant["grant_expenses"]]) == (
+            1, [first_id])
+
+        by_category = call_action(grants_mod.list_grant_expenses, conn, ns(
+            company_id=env["company_id"],
+            grant_id=None, status=None, category="travel",
+            from_date=None, to_date=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(by_category), by_category
+        assert (by_category["total"],
+                [entry["id"] for entry in by_category["grant_expenses"]]) == (
+            1, [second_id])
+
+        by_status = call_action(grants_mod.list_grant_expenses, conn, ns(
+            company_id=env["company_id"],
+            grant_id=None, status="draft", category=None,
+            from_date=None, to_date=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(by_status), by_status
+        assert by_status["total"] == 2
+        approved = call_action(grants_mod.list_grant_expenses, conn, ns(
+            company_id=env["company_id"],
+            grant_id=None, status="approved", category=None,
+            from_date=None, to_date=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(approved), approved
+        assert (approved["total"], approved["grant_expenses"]) == (0, [])
+
+        in_range = call_action(grants_mod.list_grant_expenses, conn, ns(
+            company_id=env["company_id"],
+            grant_id=None, status=None, category=None,
+            from_date="2026-04-01", to_date="2026-04-30",
+            limit="50", offset="0",
+        ))
+        assert is_ok(in_range), in_range
+        assert (in_range["total"],
+                [entry["id"] for entry in in_range["grant_expenses"]]) == (
+            1, [second_id])
+
+        other_company = seed_company(conn)
+        seed_naming_series(conn, other_company)
+        other_grant = seed_grant(conn, other_company, "Foreign Grant",
+                                 grantor_name="Abroad", amount="5000.00",
+                                 status="active")
+        other = call_action(grants_mod.add_grant_expense, conn, ns(
+            company_id=other_company,
+            grant_id=other_grant,
+            amount="99.99",
+            category="program",
+            description="Elsewhere",
+            expense_date="2026-05-01",
+            receipt_reference=None,
+        ))
+        assert is_ok(other), other
+        reseeded = call_action(grants_mod.list_grant_expenses, conn, ns(
+            company_id=env["company_id"],
+            grant_id=None, status=None, category=None,
+            from_date=None, to_date=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(reseeded), reseeded
+        assert reseeded["total"] == 2
+        assert other["id"] not in {entry["id"]
+                                   for entry in reseeded["grant_expenses"]}
+
+    def test_list_expenses_missing_company_refuses_without_writes(self, conn, env):
+        import grants as grants_mod
+        before = snapshot_tables(conn, ["nonprofitclaw_grant_expense",
+                                        "audit_log"])
+        result = call_action(grants_mod.list_grant_expenses, conn, ns(
+            company_id=None,
+            grant_id=None, status=None, category=None,
+            from_date=None, to_date=None,
+            limit="50", offset="0",
+        ))
+        assert is_error(result)
+        assert result["message"] == "--company-id is required"
+        assert snapshot_tables(conn, ["nonprofitclaw_grant_expense",
+                                      "audit_log"]) == before
 
 
 class TestCloseGrant:

@@ -54,6 +54,59 @@ def _round(val):
     return val.quantize(Decimal("0.01"), ROUND_HALF_UP)
 
 
+def _shift_fund_balance(conn, fund_id, delta):
+    ft = Table("nonprofitclaw_fund")
+    bq = Q.from_(ft).select(ft.current_balance).where(ft.id == P())
+    row = conn.execute(bq.get_sql(), (fund_id,)).fetchone()
+    old_text = row["current_balance"] if row is not None else "0"
+    if old_text is None:
+        old_text = "0"
+    new_text = str(_round(_dec(old_text) + delta))
+    upd = Q.update(ft).set(ft.current_balance, P()).set(ft.updated_at, now()).where(ft.id == P()).where(ft.current_balance == P())
+    cur = conn.execute(upd.get_sql(), (new_text, fund_id, old_text))
+    if cur.rowcount != 1:
+        raise ValueError("Concurrent change to nonprofitclaw_fund %s: current_balance is no longer %s; nothing was written" % (fund_id, old_text))
+
+
+def _exact_donor_totals(conn, donor_id):
+    dq = Q.from_(_don).select(_don.amount).where(_don.donor_id == P()).where(_don.status.notin(["refunded", "cancelled"]))
+    rows = conn.execute(dq.get_sql(), (donor_id,)).fetchall()
+    cq = Q.from_(_don).select(fn.Count("*").as_("cnt")).where(_don.donor_id == P()).where(_don.status.notin(["refunded", "cancelled"]))
+    cnt = conn.execute(cq.get_sql(), (donor_id,)).fetchone()["cnt"] or 0
+    if not rows:
+        return "0", cnt
+    total = sum((_dec(r["amount"]) for r in rows), Decimal("0"))
+    return str(_round(total)), cnt
+
+
+def _guarded_donor_totals(conn, donor_id, old_total, new_total, new_count, last_date, first_date=None, keep_first=False):
+    t = Table("nonprofitclaw_donor_ext")
+    if keep_first:
+        upd = Q.update(t).set(t.total_donated, P()).set(t.donation_count, P()).set(t.last_donation_date, P()).set(t.first_donation_date, LiteralValue("COALESCE(first_donation_date, ?)")).set(t.updated_at, now()).where(t.id == P()).where(t.total_donated == P())
+        cur = conn.execute(upd.get_sql(), (new_total, new_count, last_date, first_date, donor_id, old_total))
+    else:
+        upd = Q.update(t).set(t.total_donated, P()).set(t.donation_count, P()).set(t.last_donation_date, P()).set(t.updated_at, now()).where(t.id == P()).where(t.total_donated == P())
+        cur = conn.execute(upd.get_sql(), (new_total, new_count, last_date, donor_id, old_total))
+    if cur.rowcount != 1:
+        raise ValueError("Concurrent change to nonprofitclaw_donor_ext %s: total_donated is no longer %s; nothing was written" % (donor_id, old_total))
+
+
+def _guarded_campaign_raised(conn, campaign_id, old_raised, new_raised):
+    ct = Table("nonprofitclaw_campaign")
+    upd = Q.update(ct).set(ct.raised_amount, P()).set(ct.donor_count, LiteralValue("donor_count + 1")).set(ct.updated_at, now()).where(ct.id == P()).where(ct.raised_amount == P())
+    cur = conn.execute(upd.get_sql(), (new_raised, campaign_id, old_raised))
+    if cur.rowcount != 1:
+        raise ValueError("Concurrent change to nonprofitclaw_campaign %s: raised_amount is no longer %s; nothing was written" % (campaign_id, old_raised))
+
+
+def _guarded_campaign_refund(conn, campaign_id, old_raised, new_raised, old_count, new_count):
+    ct = Table("nonprofitclaw_campaign")
+    upd = Q.update(ct).set(ct.raised_amount, P()).set(ct.donor_count, P()).set(ct.updated_at, now()).where(ct.id == P()).where(ct.raised_amount == P()).where(ct.donor_count == P())
+    cur = conn.execute(upd.get_sql(), (new_raised, new_count, campaign_id, old_raised, old_count))
+    if cur.rowcount != 1:
+        raise ValueError("Concurrent change to nonprofitclaw_campaign %s: raised_amount is no longer %s; nothing was written" % (campaign_id, old_raised))
+
+
 # ------------------------------------------------------------------
 # Donor CRUD
 # ------------------------------------------------------------------
@@ -103,8 +156,8 @@ def add_donor(conn, args):
         getattr(args, "notes", None),
         1, company_id,
     ))
+    audit(conn, SKILL, "nonprofit-add-donor", "nonprofitclaw_donor_ext", donor_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-add-donor", donor_id, company_id)
     return ok({"id": donor_id, "customer_id": customer_id, "naming_series": naming, "name": name})
 
 
@@ -155,12 +208,12 @@ def update_donor(conn, args):
         ext_data["updated_at"] = now()
         sql, params = dynamic_update("nonprofitclaw_donor_ext", ext_data, where={"id": donor_id})
         conn.execute(sql, params)
+        audit(conn, SKILL, "nonprofit-update-donor", "nonprofitclaw_donor_ext", donor_id)
         conn.commit()
 
     if not core_args and not ext_data:
         return err("No fields to update")
 
-    audit(conn, SKILL, "nonprofit-update-donor", donor_id, row["company_id"])
     return ok({"id": donor_id, "updated": True})
 
 
@@ -310,14 +363,12 @@ def merge_donors(conn, args):
         upd3_sql, upd3_p = dynamic_update("nonprofitclaw_tax_receipt", {"donor_id": target_id}, where={"donor_id": source_id})
         conn.execute(upd3_sql, upd3_p)
 
-        # Recalculate target donor stats
-        stats_q = (
-            Q.from_(_don)
-            .select(fn.Count("*").as_("cnt"), LiteralValue("SUM(CAST(amount AS NUMERIC))").as_("total"))
-            .where(_don.donor_id == P())
-            .where(_don.status.notin(["refunded", "cancelled"]))
-        )
-        stats = conn.execute(stats_q.get_sql(), (target_id,)).fetchone()
+        dt0 = Table("nonprofitclaw_donor_ext")
+        old_row = conn.execute(Q.from_(dt0).select(dt0.total_donated).where(dt0.id == P()).get_sql(), (target_id,)).fetchone()
+        old_total = old_row["total_donated"] if old_row is not None else "0"
+        if old_total is None:
+            old_total = "0"
+        new_total, new_count = _exact_donor_totals(conn, target_id)
 
         last_q = (
             Q.from_(_don)
@@ -335,29 +386,22 @@ def merge_donors(conn, args):
         )
         first_date = conn.execute(first_q.get_sql(), (target_id,)).fetchone()
 
-        new_total = str(_round(_dec(stats["total"]))) if stats["total"] else "0"
-        new_count = stats["cnt"] or 0
-
-        upd_target = {
-            "total_donated": new_total,
-            "donation_count": new_count,
-            "last_donation_date": last_date[0],
-            "first_donation_date": first_date[0],
-            "updated_at": now(),
-        }
-        sql_t, params_t = dynamic_update("nonprofitclaw_donor_ext", upd_target, where={"id": target_id})
-        conn.execute(sql_t, params_t)
+        tt = Table("nonprofitclaw_donor_ext")
+        upd_t = Q.update(tt).set(tt.total_donated, P()).set(tt.donation_count, P()).set(tt.last_donation_date, P()).set(tt.first_donation_date, P()).set(tt.updated_at, now()).where(tt.id == P()).where(tt.total_donated == P())
+        cur_t = conn.execute(upd_t.get_sql(), (new_total, new_count, last_date[0], first_date[0], target_id, old_total))
+        if cur_t.rowcount != 1:
+            raise ValueError("Concurrent change to nonprofitclaw_donor_ext %s: total_donated is no longer %s; nothing was written" % (target_id, old_total))
 
         # Delete source ext record (core customer record remains for audit trail)
         t = Table("nonprofitclaw_donor_ext")
         del_q = Q.from_(t).delete().where(t.id == P())
         conn.execute(del_q.get_sql(), (source_id,))
+        audit(conn, SKILL, "nonprofit-merge-donors", "nonprofitclaw_donor_ext", target_id)
         conn.commit()
     except Exception as e:
         conn.rollback()
         return err(f"Merge failed: {e}")
 
-    audit(conn, SKILL, "nonprofit-merge-donors", target_id, target["company_id"])
     return ok({
         "target_donor_id": target_id,
         "source_donor_id": source_id,
@@ -412,15 +456,21 @@ def add_donation(conn, args):
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id:
-        fq = Q.from_(_fund).select(_fund.id).where(_fund.id == P())
-        if not conn.execute(fq.get_sql(), (fund_id,)).fetchone():
+        fq = Q.from_(_fund).select(_fund.id, _fund.company_id).where(_fund.id == P())
+        fund_row = conn.execute(fq.get_sql(), (fund_id,)).fetchone()
+        if not fund_row:
             return err(f"Fund {fund_id} not found")
+        if fund_row["company_id"] != company_id:
+            return err("Fund does not belong to this company")
 
     campaign_id = getattr(args, "campaign_id", None)
     if campaign_id:
-        cq = Q.from_(_campaign).select(_campaign.id).where(_campaign.id == P())
-        if not conn.execute(cq.get_sql(), (campaign_id,)).fetchone():
+        cq = Q.from_(_campaign).select(_campaign.id, _campaign.company_id).where(_campaign.id == P())
+        campaign_row = conn.execute(cq.get_sql(), (campaign_id,)).fetchone()
+        if not campaign_row:
             return err(f"Campaign {campaign_id} not found")
+        if campaign_row["company_id"] != company_id:
+            return err("Campaign does not belong to this company")
 
     # GL account IDs (optional — graceful degradation)
     cash_account_id = getattr(args, "cash_account_id", None)
@@ -468,7 +518,7 @@ def add_donation(conn, args):
                 ids = insert_gl_entries(
                     conn,
                     gl_entries,
-                    voucher_type="donation",
+                    voucher_type="journal_entry",
                     voucher_id=donation_id,
                     posting_date=donation_date,
                     company_id=company_id,
@@ -478,21 +528,16 @@ def add_donation(conn, args):
                 sql_gl, params_gl = dynamic_update("nonprofitclaw_donation",
                     {"gl_entry_ids": gl_entry_ids}, where={"id": donation_id})
                 conn.execute(sql_gl, params_gl)
-            except (ValueError, Exception):
-                # GL posting failed — donation still recorded, no GL entries
-                pass
+            except Exception as e:
+                conn.rollback()
+                err(f"GL posting failed for donation {naming}: {e}")
 
-        # Update donor ext stats
-        stats_q = (
-            Q.from_(_don)
-            .select(fn.Count("*").as_("cnt"), LiteralValue("SUM(CAST(amount AS NUMERIC))").as_("total"))
-            .where(_don.donor_id == P())
-            .where(_don.status.notin(["refunded", "cancelled"]))
-        )
-        stats = conn.execute(stats_q.get_sql(), (donor_id,)).fetchone()
-
-        new_total = str(_round(_dec(stats["total"]))) if stats["total"] else "0"
-        new_count = stats["cnt"] or 0
+        dt = Table("nonprofitclaw_donor_ext")
+        old_donor_row = conn.execute(Q.from_(dt).select(dt.total_donated).where(dt.id == P()).get_sql(), (donor_id,)).fetchone()
+        old_donor_total = old_donor_row["total_donated"] if old_donor_row is not None else "0"
+        if old_donor_total is None:
+            old_donor_total = "0"
+        new_total, new_count = _exact_donor_totals(conn, donor_id)
 
         first_q = (
             Q.from_(_don)
@@ -502,54 +547,30 @@ def add_donation(conn, args):
         )
         first_date = conn.execute(first_q.get_sql(), (donor_id,)).fetchone()
 
-        upd_donor = {
-            "total_donated": new_total,
-            "donation_count": new_count,
-            "last_donation_date": donation_date,
-            "updated_at": now(),
-        }
-        # Use COALESCE for first_donation_date to preserve existing value
-        t = Table("nonprofitclaw_donor_ext")
-        upd_q = (
-            Q.update(t)
-            .set(t.total_donated, P())
-            .set(t.donation_count, P())
-            .set(t.last_donation_date, P())
-            .set(t.first_donation_date, LiteralValue("COALESCE(first_donation_date, ?)"))
-            .set(t.updated_at, now())
-            .where(t.id == P())
-        )
-        conn.execute(upd_q.get_sql(), (new_total, new_count, donation_date, first_date[0], donor_id))
+        _guarded_donor_totals(conn, donor_id, old_donor_total, new_total, new_count, donation_date, first_date[0], keep_first=True)
 
-        # Update fund balance if applicable
         if fund_id:
-            ft = Table("nonprofitclaw_fund")
-            fund_upd = (
-                Q.update(ft)
-                .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS NUMERIC) + ? AS TEXT)"))
-                .set(ft.updated_at, now())
-                .where(ft.id == P())
-            )
-            conn.execute(fund_upd.get_sql(), (str(amount), fund_id))
+            _shift_fund_balance(conn, fund_id, amount)
 
-        # Update campaign raised_amount if applicable
         if campaign_id:
             ct = Table("nonprofitclaw_campaign")
-            camp_upd = (
-                Q.update(ct)
-                .set(ct.raised_amount, LiteralValue("CAST(CAST(raised_amount AS NUMERIC) + ? AS TEXT)"))
-                .set(ct.donor_count, LiteralValue("donor_count + 1"))
-                .set(ct.updated_at, now())
-                .where(ct.id == P())
-            )
-            conn.execute(camp_upd.get_sql(), (str(amount), campaign_id))
+            cur = conn.execute(
+                Q.from_(ct).select(ct.raised_amount).where(ct.id == P()).get_sql(),
+                (campaign_id,),
+            ).fetchone()
+            if cur is not None:
+                old_raised = cur["raised_amount"]
+                if old_raised is None:
+                    old_raised = "0"
+                new_raised = str(_round(_dec(old_raised) + amount))
+                _guarded_campaign_raised(conn, campaign_id, old_raised, new_raised)
 
+        audit(conn, SKILL, "nonprofit-add-donation", "nonprofitclaw_donation", donation_id)
         conn.commit()
     except Exception as e:
         conn.rollback()
         return err(f"Failed to add donation: {e}")
 
-    audit(conn, SKILL, "nonprofit-add-donation", donation_id, company_id)
     result = {"id": donation_id, "naming_series": naming, "amount": str(amount)}
     if gl_entry_ids:
         result["gl_entry_ids"] = json.loads(gl_entry_ids)
@@ -591,8 +612,8 @@ def update_donation(conn, args):
     data["updated_at"] = now()
     sql, params = dynamic_update("nonprofitclaw_donation", data, where={"id": donation_id})
     conn.execute(sql, params)
+    audit(conn, SKILL, "nonprofit-update-donation", "nonprofitclaw_donation", donation_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-update-donation", donation_id, row["company_id"])
     return ok({"id": donation_id, "updated": True})
 
 
@@ -718,26 +739,21 @@ def refund_donation(conn, args):
             try:
                 reversal_ids = reverse_gl_entries(
                     conn,
-                    voucher_type="donation",
+                    voucher_type="journal_entry",
                     voucher_id=donation_id,
                     posting_date=donation_date,
                 )
                 gl_reversal_ids = reversal_ids
-            except (ValueError, Exception):
-                # GL reversal failed — refund still proceeds
-                pass
+            except Exception as e:
+                conn.rollback()
+                err(f"GL reversal failed for donation {donation_id}: {e}")
 
-        # Update donor stats
-        stats_q = (
-            Q.from_(_don)
-            .select(fn.Count("*").as_("cnt"), LiteralValue("SUM(CAST(amount AS NUMERIC))").as_("total"))
-            .where(_don.donor_id == P())
-            .where(_don.status.notin(["refunded", "cancelled"]))
-        )
-        stats = conn.execute(stats_q.get_sql(), (donor_id,)).fetchone()
-
-        new_total = str(_round(_dec(stats["total"]))) if stats["total"] else "0"
-        new_count = stats["cnt"] or 0
+        dt = Table("nonprofitclaw_donor_ext")
+        old_donor_row = conn.execute(Q.from_(dt).select(dt.total_donated).where(dt.id == P()).get_sql(), (donor_id,)).fetchone()
+        old_donor_total = old_donor_row["total_donated"] if old_donor_row is not None else "0"
+        if old_donor_total is None:
+            old_donor_total = "0"
+        new_total, new_count = _exact_donor_totals(conn, donor_id)
 
         last_q = (
             Q.from_(_don)
@@ -747,44 +763,34 @@ def refund_donation(conn, args):
         )
         last_date = conn.execute(last_q.get_sql(), (donor_id,)).fetchone()
 
-        upd_donor = {
-            "total_donated": new_total,
-            "donation_count": new_count,
-            "last_donation_date": last_date[0],
-            "updated_at": now(),
-        }
-        sql_d, params_d = dynamic_update("nonprofitclaw_donor_ext", upd_donor, where={"id": donor_id})
-        conn.execute(sql_d, params_d)
+        _guarded_donor_totals(conn, donor_id, old_donor_total, new_total, new_count, last_date[0])
 
-        # Reverse fund balance if applicable
         if fund_id:
-            ft = Table("nonprofitclaw_fund")
-            fund_upd = (
-                Q.update(ft)
-                .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS NUMERIC) - ? AS TEXT)"))
-                .set(ft.updated_at, now())
-                .where(ft.id == P())
-            )
-            conn.execute(fund_upd.get_sql(), (str(amount), fund_id))
+            _shift_fund_balance(conn, fund_id, -amount)
 
-        # Reverse campaign stats if applicable
         if campaign_id:
             ct = Table("nonprofitclaw_campaign")
-            camp_upd = (
-                Q.update(ct)
-                .set(ct.raised_amount, LiteralValue("CAST(CAST(raised_amount AS NUMERIC) - ? AS TEXT)"))
-                .set(ct.donor_count, LiteralValue("MAX(donor_count - 1, 0)"))
-                .set(ct.updated_at, now())
-                .where(ct.id == P())
-            )
-            conn.execute(camp_upd.get_sql(), (str(amount), campaign_id))
+            cur = conn.execute(
+                Q.from_(ct).select(ct.raised_amount, ct.donor_count).where(ct.id == P()).get_sql(),
+                (campaign_id,),
+            ).fetchone()
+            if cur is not None:
+                old_raised = cur["raised_amount"]
+                if old_raised is None:
+                    old_raised = "0"
+                old_count = cur["donor_count"]
+                if old_count is None:
+                    old_count = 0
+                new_raised = str(_round(_dec(old_raised) - amount))
+                new_count_camp = old_count - 1 if old_count > 0 else 0
+                _guarded_campaign_refund(conn, campaign_id, old_raised, new_raised, old_count, new_count_camp)
 
+        audit(conn, SKILL, "nonprofit-refund-donation", "nonprofitclaw_donation", donation_id)
         conn.commit()
     except Exception as e:
         conn.rollback()
         return err(f"Refund failed: {e}")
 
-    audit(conn, SKILL, "nonprofit-refund-donation", donation_id, row["company_id"])
     result = {"id": donation_id, "refunded": True, "amount": str(amount)}
     if gl_reversal_ids:
         result["gl_reversal_ids"] = gl_reversal_ids

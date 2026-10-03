@@ -14,7 +14,7 @@ import pytest
 from decimal import Decimal
 from nonprofit_helpers import (
     call_action, ns, is_error, is_ok, load_db_query,
-    seed_fund,
+    seed_company, seed_fund, seed_naming_series, snapshot_tables,
 )
 
 mod = load_db_query()
@@ -298,24 +298,230 @@ class TestApproveFundTransfer:
 
 
 class TestListFundTransfers:
+    """Behaviour of nonprofit-list-fund-transfers, read back from the database.
+
+    The transfers below are created through nonprofit-add-fund-transfer, then
+    the stored nonprofitclaw_fund_transfer rows are read back and compared
+    field-for-field with what the list response returns. Draft transfers move
+    no money, so both fund balances must be unchanged afterwards.
+
+    nonprofit-list-fund-transfers posts nothing to the general ledger, so this
+    asserts stored rows, never ledger legs; a later reader must not add a
+    balanced-legs assertion here.
+    """
+
+    def _make_transfer(self, conn, env, to_fund, amount, transfer_date, reason):
+        import funds as funds_mod
+        result = call_action(funds_mod.add_fund_transfer, conn, ns(
+            company_id=env["company_id"],
+            from_fund_id=env["fund_id"],
+            to_fund_id=to_fund,
+            amount=amount,
+            transfer_date=transfer_date,
+            reason=reason,
+            approved_by=None,
+        ))
+        assert is_ok(result), result
+        return result["id"]
+
     def test_list_transfers(self, conn, env):
         import funds as funds_mod
+        target = seed_fund(conn, env["company_id"], "Target Fund",
+                           "temporarily_restricted")
+        first_id = self._make_transfer(conn, env, target, "1500.10",
+                                       "2026-03-01", "Reallocation")
+        second_id = self._make_transfer(conn, env, target, "250.25",
+                                        "2026-04-15", "Top-up")
+
+        stored = {
+            row["id"]: dict(row) for row in conn.execute(
+                "SELECT * FROM nonprofitclaw_fund_transfer").fetchall()
+        }
+        assert stored[first_id]["amount"] == "1500.10"
+        assert stored[second_id]["amount"] == "250.25"
+        assert stored[first_id]["from_fund_id"] == env["fund_id"]
+        assert stored[first_id]["to_fund_id"] == target
+        assert stored[first_id]["transfer_date"] == "2026-03-01"
+        assert stored[first_id]["reason"] == "Reallocation"
+        assert stored[first_id]["status"] == "draft"
+        assert stored[second_id]["transfer_date"] == "2026-04-15"
+        assert stored[second_id]["status"] == "draft"
+
+        balances_before = {
+            row["id"]: row["current_balance"] for row in conn.execute(
+                "SELECT id, current_balance FROM nonprofitclaw_fund").fetchall()
+        }
+
         result = call_action(funds_mod.list_fund_transfers, conn, ns(
             company_id=env["company_id"],
             status=None, fund_id=None,
             limit="50", offset="0",
         ))
         assert is_ok(result), result
-        assert "fund_transfers" in result
+        assert result["total"] == 2
+        listed = {entry["id"]: entry for entry in result["fund_transfers"]}
+        assert set(listed) == {first_id, second_id}
+        for transfer_id, row in stored.items():
+            entry = listed[transfer_id]
+            assert entry["amount"] == row["amount"]
+            assert Decimal(entry["amount"]) == Decimal(row["amount"])
+            assert entry["from_fund_id"] == row["from_fund_id"]
+            assert entry["to_fund_id"] == row["to_fund_id"]
+            assert entry["transfer_date"] == row["transfer_date"]
+            assert entry["reason"] == row["reason"]
+            assert entry["status"] == row["status"]
+            assert entry["naming_series"] == row["naming_series"]
+        assert listed[first_id]["from_fund_name"] == "General Fund"
+        assert listed[first_id]["to_fund_name"] == "Target Fund"
+
+        by_fund = call_action(funds_mod.list_fund_transfers, conn, ns(
+            company_id=env["company_id"],
+            status=None, fund_id=env["fund_id"],
+            limit="50", offset="0",
+        ))
+        assert is_ok(by_fund), by_fund
+        assert by_fund["total"] == 2
+
+        drafts = call_action(funds_mod.list_fund_transfers, conn, ns(
+            company_id=env["company_id"],
+            status="draft", fund_id=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(drafts), drafts
+        assert drafts["total"] == 2
+        settled = call_action(funds_mod.list_fund_transfers, conn, ns(
+            company_id=env["company_id"],
+            status="completed", fund_id=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(settled), settled
+        assert (settled["total"], settled["fund_transfers"]) == (0, [])
+
+        other_company = seed_company(conn)
+        seed_naming_series(conn, other_company)
+        other_from = seed_fund(conn, other_company, "Other Source")
+        other_to = seed_fund(conn, other_company, "Other Target")
+        other = call_action(funds_mod.add_fund_transfer, conn, ns(
+            company_id=other_company,
+            from_fund_id=other_from,
+            to_fund_id=other_to,
+            amount="99.99",
+            transfer_date="2026-05-01",
+            reason="Elsewhere",
+            approved_by=None,
+        ))
+        assert is_ok(other), other
+        reseeded = call_action(funds_mod.list_fund_transfers, conn, ns(
+            company_id=env["company_id"],
+            status=None, fund_id=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(reseeded), reseeded
+        assert reseeded["total"] == 2
+        assert other["id"] not in {entry["id"]
+                                   for entry in reseeded["fund_transfers"]}
+
+        balances_after = {
+            row["id"]: row["current_balance"] for row in conn.execute(
+                "SELECT id, current_balance FROM nonprofitclaw_fund").fetchall()
+        }
+        assert balances_after[env["fund_id"]] == balances_before[env["fund_id"]]
+        assert balances_after[target] == balances_before[target]
+
+    def test_list_transfers_missing_company_refuses_without_writes(self, conn, env):
+        import funds as funds_mod
+        before = snapshot_tables(conn, ["nonprofitclaw_fund_transfer",
+                                        "audit_log"])
+        result = call_action(funds_mod.list_fund_transfers, conn, ns(
+            company_id=None,
+            status=None, fund_id=None,
+            limit="50", offset="0",
+        ))
+        assert is_error(result)
+        assert result["message"] == "--company-id is required"
+        assert snapshot_tables(conn, ["nonprofitclaw_fund_transfer",
+                                      "audit_log"]) == before
 
 
 class TestFundBalanceReport:
+    """Behaviour of nonprofit-fund-balance-report, read back from the database.
+
+    The report is a read: it must return one entry per active fund of the
+    company with the exact stored balance, a total that is the exact sum, and
+    must exclude inactive funds and other companies' funds without changing
+    any stored row.
+
+    nonprofit-fund-balance-report posts nothing to the general ledger, so this
+    asserts stored rows, never ledger legs; a later reader must not add a
+    balanced-legs assertion here.
+    """
+
     def test_balance_report(self, conn, env):
         import funds as funds_mod
+        operating = seed_fund(conn, env["company_id"], "Operating Reserve",
+                              "unrestricted", "1500.10")
+        building = seed_fund(conn, env["company_id"], "Building Fund",
+                             "temporarily_restricted", "250.25")
+        assert is_ok(call_action(funds_mod.update_fund, conn, ns(
+            id=building,
+            name=None, fund_type=None, description=None,
+            target_amount="1001.00",
+            start_date=None, end_date=None, is_active=None,
+        )))
+        dormant = seed_fund(conn, env["company_id"], "Dormant Fund",
+                            "unrestricted", "9999.99")
+        assert is_ok(call_action(funds_mod.update_fund, conn, ns(
+            id=dormant,
+            name=None, fund_type=None, description=None, target_amount=None,
+            start_date=None, end_date=None, is_active="0",
+        )))
+        other_company = seed_company(conn)
+        seed_naming_series(conn, other_company)
+        seed_fund(conn, other_company, "Foreign Fund", "unrestricted",
+                  "777.77")
+
+        balances_before = {
+            row["id"]: row["current_balance"] for row in conn.execute(
+                "SELECT id, current_balance FROM nonprofitclaw_fund").fetchall()
+        }
+
         result = call_action(funds_mod.fund_balance_report, conn, ns(
             company_id=env["company_id"],
         ))
         assert is_ok(result), result
-        assert "funds" in result
-        assert "total_balance" in result
-        assert "fund_count" in result
+        assert result["fund_count"] == 3
+        assert result["total_balance"] == "1750.35"
+        assert Decimal(result["total_balance"]) == Decimal("1750.35")
+
+        by_id = {entry["id"]: entry for entry in result["funds"]}
+        assert set(by_id) == {env["fund_id"], operating, building}
+        assert by_id[operating]["current_balance"] == "1500.10"
+        assert by_id[building]["current_balance"] == "250.25"
+        assert by_id[env["fund_id"]]["current_balance"] ==             balances_before[env["fund_id"]]
+        assert by_id[building]["percent_of_target"] == "25.00"
+        names = [entry["name"] for entry in result["funds"]]
+        assert names == sorted(names)
+
+        stored_total = sum(
+            (Decimal(balance) for fund_id, balance in balances_before.items()
+             if fund_id in by_id),
+            Decimal("0"),
+        )
+        assert Decimal(result["total_balance"]) == stored_total
+
+        balances_after = {
+            row["id"]: row["current_balance"] for row in conn.execute(
+                "SELECT id, current_balance FROM nonprofitclaw_fund").fetchall()
+        }
+        assert balances_after == balances_before
+
+    def test_balance_report_missing_company_refuses_without_writes(self, conn, env):
+        import funds as funds_mod
+        before = snapshot_tables(conn, ["nonprofitclaw_fund", "audit_log"])
+        result = call_action(funds_mod.fund_balance_report, conn, ns(
+            company_id=None,
+        ))
+        assert is_error(result)
+        assert result["message"] == "--company-id is required"
+        assert snapshot_tables(conn, ["nonprofitclaw_fund",
+                                      "audit_log"]) == before

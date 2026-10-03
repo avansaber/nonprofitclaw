@@ -34,8 +34,8 @@ import pytest
 from decimal import Decimal
 from nonprofit_helpers import (
     call_action, ns, is_error, is_ok, load_db_query,
-    seed_volunteer, seed_program, seed_campaign, seed_donor, seed_donation,
-    seed_fund, _uuid,
+    seed_company, seed_volunteer, seed_program, seed_campaign, seed_donor,
+    seed_donation, seed_fund, seed_naming_series, snapshot_tables, _uuid,
 )
 
 mod = load_db_query()
@@ -239,8 +239,61 @@ class TestCompleteVolunteerShift:
 
 
 class TestListVolunteerShifts:
+    """Behaviour of nonprofit-list-volunteer-shifts, read back from the database.
+
+    The shifts below are created through nonprofit-add-volunteer-shift, then
+    the stored nonprofitclaw_volunteer_shift rows are read back and compared
+    field-for-field with what the list response returns. Completing one shift
+    through nonprofit-complete-volunteer-shift must be reflected in the
+    status filter.
+
+    nonprofit-list-volunteer-shifts never posts to the general ledger (no
+    gl_entry write exists in volunteers.py), so this asserts stored rows,
+    never ledger legs; a later reader must not add a balanced-legs assertion
+    here.
+    """
+
     def test_list_shifts(self, conn, env):
         import volunteers as vol_mod
+        first = call_action(vol_mod.add_volunteer_shift, conn, ns(
+            company_id=env["company_id"],
+            volunteer_id=env["volunteer_id"],
+            program_id=env["program_id"],
+            shift_date="2026-03-15",
+            hours="4.50",
+            description="Morning tutoring",
+        ))
+        assert is_ok(first), first
+        second = call_action(vol_mod.add_volunteer_shift, conn, ns(
+            company_id=env["company_id"],
+            volunteer_id=env["volunteer_id"],
+            program_id=None,
+            shift_date="2026-04-10",
+            hours="2.25",
+            description="Event setup",
+        ))
+        assert is_ok(second), second
+
+        stored = {
+            row["id"]: dict(row) for row in conn.execute(
+                "SELECT * FROM nonprofitclaw_volunteer_shift").fetchall()
+        }
+        assert stored[first["id"]]["hours"] == "4.50"
+        assert stored[second["id"]]["hours"] == "2.25"
+        assert stored[first["id"]]["volunteer_id"] == env["volunteer_id"]
+        assert stored[first["id"]]["program_id"] == env["program_id"]
+        assert stored[second["id"]]["program_id"] is None
+        assert stored[first["id"]]["shift_date"] == "2026-03-15"
+        assert stored[first["id"]]["description"] == "Morning tutoring"
+        assert stored[first["id"]]["status"] == "scheduled"
+
+        assert is_ok(call_action(vol_mod.complete_volunteer_shift, conn, ns(
+            id=first["id"], hours=None,
+        )))
+        assert conn.execute(
+            "SELECT status FROM nonprofitclaw_volunteer_shift WHERE id=?",
+            (first["id"],)).fetchone()["status"] == "completed"
+
         result = call_action(vol_mod.list_volunteer_shifts, conn, ns(
             company_id=env["company_id"],
             volunteer_id=None, program_id=None, status=None,
@@ -248,7 +301,104 @@ class TestListVolunteerShifts:
             limit="50", offset="0",
         ))
         assert is_ok(result), result
-        assert "volunteer_shifts" in result
+        assert result["total"] == 2
+        listed = {entry["id"]: entry for entry in result["volunteer_shifts"]}
+        assert set(listed) == {first["id"], second["id"]}
+        for shift_id in (first["id"], second["id"]):
+            row = conn.execute(
+                "SELECT * FROM nonprofitclaw_volunteer_shift WHERE id=?",
+                (shift_id,)).fetchone()
+            entry = listed[shift_id]
+            assert entry["hours"] == row["hours"]
+            assert Decimal(entry["hours"]) == Decimal(row["hours"])
+            assert entry["volunteer_id"] == row["volunteer_id"]
+            assert entry["program_id"] == row["program_id"]
+            assert entry["shift_date"] == row["shift_date"]
+            assert entry["description"] == row["description"]
+            assert entry["status"] == row["status"]
+            assert entry["naming_series"] == row["naming_series"]
+        assert listed[first["id"]]["status"] == "completed"
+        assert listed[second["id"]]["status"] == "scheduled"
+        assert listed[first["id"]]["volunteer_name"] == "Bob Helper"
+        assert listed[first["id"]]["program_name"] == "Youth Outreach"
+
+        by_volunteer = call_action(vol_mod.list_volunteer_shifts, conn, ns(
+            company_id=env["company_id"],
+            volunteer_id=env["volunteer_id"], program_id=None, status=None,
+            from_date=None, to_date=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(by_volunteer), by_volunteer
+        assert by_volunteer["total"] == 2
+
+        by_program = call_action(vol_mod.list_volunteer_shifts, conn, ns(
+            company_id=env["company_id"],
+            volunteer_id=None, program_id=env["program_id"], status=None,
+            from_date=None, to_date=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(by_program), by_program
+        assert (by_program["total"],
+                [entry["id"] for entry in by_program["volunteer_shifts"]]) == (
+            1, [first["id"]])
+
+        completed = call_action(vol_mod.list_volunteer_shifts, conn, ns(
+            company_id=env["company_id"],
+            volunteer_id=None, program_id=None, status="completed",
+            from_date=None, to_date=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(completed), completed
+        assert (completed["total"],
+                [entry["id"] for entry in completed["volunteer_shifts"]]) == (
+            1, [first["id"]])
+
+        in_range = call_action(vol_mod.list_volunteer_shifts, conn, ns(
+            company_id=env["company_id"],
+            volunteer_id=None, program_id=None, status=None,
+            from_date="2026-04-01", to_date="2026-04-30",
+            limit="50", offset="0",
+        ))
+        assert is_ok(in_range), in_range
+        assert (in_range["total"],
+                [entry["id"] for entry in in_range["volunteer_shifts"]]) == (
+            1, [second["id"]])
+
+        other_company = seed_company(conn)
+        seed_naming_series(conn, other_company)
+        other_volunteer = seed_volunteer(conn, other_company, "Far Helper",
+                                         "far@example.com")
+        assert is_ok(call_action(vol_mod.add_volunteer_shift, conn, ns(
+            company_id=other_company,
+            volunteer_id=other_volunteer,
+            program_id=None,
+            shift_date="2026-05-01",
+            hours="1.00",
+            description="Elsewhere",
+        )))
+        reseeded = call_action(vol_mod.list_volunteer_shifts, conn, ns(
+            company_id=env["company_id"],
+            volunteer_id=None, program_id=None, status=None,
+            from_date=None, to_date=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(reseeded), reseeded
+        assert reseeded["total"] == 2
+
+    def test_list_shifts_missing_company_refuses_without_writes(self, conn, env):
+        import volunteers as vol_mod
+        before = snapshot_tables(conn, ["nonprofitclaw_volunteer_shift",
+                                        "audit_log"])
+        result = call_action(vol_mod.list_volunteer_shifts, conn, ns(
+            company_id=None,
+            volunteer_id=None, program_id=None, status=None,
+            from_date=None, to_date=None,
+            limit="50", offset="0",
+        ))
+        assert is_error(result)
+        assert result["message"] == "--company-id is required"
+        assert snapshot_tables(conn, ["nonprofitclaw_volunteer_shift",
+                                      "audit_log"]) == before
 
 
 class TestVolunteerHoursReport:
@@ -455,15 +605,164 @@ class TestAddPledge:
 
 
 class TestListPledges:
+    """Behaviour of nonprofit-list-pledges, read back from the database.
+
+    The pledges below are created through nonprofit-add-pledge, then the
+    stored nonprofitclaw_pledge rows are read back and compared field-for-
+    field with what the list response returns. A partial fulfillment through
+    nonprofit-fulfill-pledge must be reflected in the remaining and
+    percent_fulfilled the list computes.
+
+    nonprofit-list-pledges never posts to the general ledger (no gl_entry
+    write exists in campaigns.py), so this asserts stored rows, never ledger
+    legs; a later reader must not add a balanced-legs assertion here.
+    """
+
     def test_list_pledges(self, conn, env):
         import campaigns as camp_mod
+        first = call_action(camp_mod.add_pledge, conn, ns(
+            company_id=env["company_id"],
+            donor_id=env["donor_id"],
+            campaign_id=env["campaign_id"],
+            fund_id=None,
+            amount="1000.00",
+            pledge_date="2026-03-01",
+            frequency="one_time",
+            next_due_date=None,
+            end_date=None,
+            notes=None,
+        ))
+        assert is_ok(first), first
+        second = call_action(camp_mod.add_pledge, conn, ns(
+            company_id=env["company_id"],
+            donor_id=env["donor_id"],
+            campaign_id=env["campaign_id"],
+            fund_id=None,
+            amount="250.50",
+            pledge_date="2026-04-01",
+            frequency="monthly",
+            next_due_date=None,
+            end_date=None,
+            notes="Monthly gift",
+        ))
+        assert is_ok(second), second
+
+        stored = {
+            row["id"]: dict(row) for row in conn.execute(
+                "SELECT * FROM nonprofitclaw_pledge").fetchall()
+        }
+        assert stored[first["id"]]["amount"] == "1000.00"
+        assert stored[second["id"]]["amount"] == "250.50"
+        assert stored[first["id"]]["donor_id"] == env["donor_id"]
+        assert stored[first["id"]]["campaign_id"] == env["campaign_id"]
+        assert stored[first["id"]]["pledge_date"] == "2026-03-01"
+        assert stored[second["id"]]["frequency"] == "monthly"
+        assert stored[second["id"]]["notes"] == "Monthly gift"
+        assert stored[first["id"]]["status"] == "active"
+
+        partial = call_action(camp_mod.fulfill_pledge, conn, ns(
+            pledge_id=first["id"], id=None, amount="400.00",
+        ))
+        assert is_ok(partial), partial
+        assert partial["remaining"] == "600.00"
+        row = conn.execute(
+            "SELECT * FROM nonprofitclaw_pledge WHERE id=?",
+            (first["id"],)).fetchone()
+        assert row["fulfilled_amount"] == "400.00"
+        assert row["status"] == "partially_fulfilled"
+
         result = call_action(camp_mod.list_pledges, conn, ns(
             company_id=env["company_id"],
             donor_id=None, campaign_id=None, status=None,
             limit="50", offset="0",
         ))
         assert is_ok(result), result
-        assert "pledges" in result
+        assert result["total"] == 2
+        listed = {entry["id"]: entry for entry in result["pledges"]}
+        assert set(listed) == {first["id"], second["id"]}
+        for pledge_id in (first["id"], second["id"]):
+            row = conn.execute(
+                "SELECT * FROM nonprofitclaw_pledge WHERE id=?",
+                (pledge_id,)).fetchone()
+            entry = listed[pledge_id]
+            assert entry["amount"] == row["amount"]
+            assert Decimal(entry["amount"]) == Decimal(row["amount"])
+            assert entry["fulfilled_amount"] == row["fulfilled_amount"]
+            assert entry["donor_id"] == row["donor_id"]
+            assert entry["campaign_id"] == row["campaign_id"]
+            assert entry["pledge_date"] == row["pledge_date"]
+            assert entry["frequency"] == row["frequency"]
+            assert entry["status"] == row["status"]
+            assert entry["naming_series"] == row["naming_series"]
+        assert listed[first["id"]]["remaining"] == "600.00"
+        assert listed[first["id"]]["percent_fulfilled"] == "40.00"
+        assert listed[second["id"]]["remaining"] == "250.50"
+        assert listed[first["id"]]["donor_name"] == "Alice Benefactor"
+        assert listed[first["id"]]["campaign_name"] == "Annual Giving"
+
+        by_donor = call_action(camp_mod.list_pledges, conn, ns(
+            company_id=env["company_id"],
+            donor_id=env["donor_id"], campaign_id=None, status=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(by_donor), by_donor
+        assert by_donor["total"] == 2
+
+        by_campaign = call_action(camp_mod.list_pledges, conn, ns(
+            company_id=env["company_id"],
+            donor_id=None, campaign_id=env["campaign_id"], status=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(by_campaign), by_campaign
+        assert by_campaign["total"] == 2
+
+        partial_list = call_action(camp_mod.list_pledges, conn, ns(
+            company_id=env["company_id"],
+            donor_id=None, campaign_id=None, status="partially_fulfilled",
+            limit="50", offset="0",
+        ))
+        assert is_ok(partial_list), partial_list
+        assert (partial_list["total"],
+                [entry["id"] for entry in partial_list["pledges"]]) == (
+            1, [first["id"]])
+
+        other_company = seed_company(conn)
+        seed_naming_series(conn, other_company)
+        other_donor = seed_donor(conn, other_company, "Far Donor")
+        other_campaign = seed_campaign(conn, other_company, "Far Campaign",
+                                       "5000.00", "active")
+        assert is_ok(call_action(camp_mod.add_pledge, conn, ns(
+            company_id=other_company,
+            donor_id=other_donor["donor_id"],
+            campaign_id=other_campaign,
+            fund_id=None,
+            amount="10.00",
+            pledge_date="2026-05-01",
+            frequency="one_time",
+            next_due_date=None,
+            end_date=None,
+            notes=None,
+        )))
+        reseeded = call_action(camp_mod.list_pledges, conn, ns(
+            company_id=env["company_id"],
+            donor_id=None, campaign_id=None, status=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(reseeded), reseeded
+        assert reseeded["total"] == 2
+
+    def test_list_pledges_missing_company_refuses_without_writes(self, conn, env):
+        import campaigns as camp_mod
+        before = snapshot_tables(conn, ["nonprofitclaw_pledge", "audit_log"])
+        result = call_action(camp_mod.list_pledges, conn, ns(
+            company_id=None,
+            donor_id=None, campaign_id=None, status=None,
+            limit="50", offset="0",
+        ))
+        assert is_error(result)
+        assert result["message"] == "--company-id is required"
+        assert snapshot_tables(conn, ["nonprofitclaw_pledge",
+                                      "audit_log"]) == before
 
 
 class TestGetPledge:
@@ -676,15 +975,148 @@ class TestGenerateTaxReceipt:
 
 
 class TestListTaxReceipts:
+    """Behaviour of nonprofit-list-tax-receipts, read back from the database.
+
+    The receipt below is created through nonprofit-generate-tax-receipt, then
+    the stored nonprofitclaw_tax_receipt row is read back and compared
+    field-for-field with what the list response returns. Issuing the receipt
+    must also flip the donation's receipt_sent flag from 0 to 1.
+
+    nonprofit-list-tax-receipts never posts to the general ledger (no
+    gl_entry write exists in compliance.py), so this asserts stored rows,
+    never ledger legs; a later reader must not add a balanced-legs assertion
+    here.
+    """
+
     def test_list_receipts(self, conn, env):
         import compliance as comp_mod
+        donation_id = seed_donation(conn, env["company_id"], env["donor_id"],
+                                    "1500.10", fund_id=env["fund_id"],
+                                    campaign_id=env["campaign_id"])
+        assert conn.execute(
+            "SELECT receipt_sent FROM nonprofitclaw_donation WHERE id=?",
+            (donation_id,)).fetchone()["receipt_sent"] == 0
+
+        created = call_action(comp_mod.generate_tax_receipt, conn, ns(
+            company_id=env["company_id"],
+            donor_id=env["donor_id"],
+            tax_year="2026",
+            receipt_type="single",
+            donation_id=donation_id,
+            sent_method="email",
+        ))
+        assert is_ok(created), created
+        assert created["amount"] == "1500.10"
+
+        row = conn.execute(
+            "SELECT * FROM nonprofitclaw_tax_receipt WHERE id=?",
+            (created["id"],)).fetchone()
+        assert row["amount"] == "1500.10"
+        assert Decimal(row["amount"]) == Decimal("1500.10")
+        assert row["donor_id"] == env["donor_id"]
+        assert row["donation_id"] == donation_id
+        assert row["tax_year"] == "2026"
+        assert row["receipt_type"] == "single"
+        assert row["sent_method"] == "email"
+        assert conn.execute(
+            "SELECT receipt_sent FROM nonprofitclaw_donation WHERE id=?",
+            (donation_id,)).fetchone()["receipt_sent"] == 1
+
         result = call_action(comp_mod.list_tax_receipts, conn, ns(
             company_id=env["company_id"],
             donor_id=None, tax_year=None, receipt_type=None,
             limit="50", offset="0",
         ))
         assert is_ok(result), result
-        assert "tax_receipts" in result
+        assert result["total"] == 1
+        assert len(result["tax_receipts"]) == 1
+        entry = result["tax_receipts"][0]
+        assert entry["id"] == created["id"]
+        assert entry["amount"] == row["amount"]
+        assert Decimal(entry["amount"]) == Decimal("1500.10")
+        assert entry["donor_id"] == row["donor_id"]
+        assert entry["donation_id"] == row["donation_id"]
+        assert entry["tax_year"] == row["tax_year"]
+        assert entry["receipt_type"] == row["receipt_type"]
+        assert entry["sent_method"] == row["sent_method"]
+        assert entry["naming_series"] == row["naming_series"]
+        assert entry["donor_name"] == "Alice Benefactor"
+
+        by_year = call_action(comp_mod.list_tax_receipts, conn, ns(
+            company_id=env["company_id"],
+            donor_id=None, tax_year="2026", receipt_type=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(by_year), by_year
+        assert by_year["total"] == 1
+        other_year = call_action(comp_mod.list_tax_receipts, conn, ns(
+            company_id=env["company_id"],
+            donor_id=None, tax_year="2025", receipt_type=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(other_year), other_year
+        assert (other_year["total"], other_year["tax_receipts"]) == (0, [])
+
+        by_type = call_action(comp_mod.list_tax_receipts, conn, ns(
+            company_id=env["company_id"],
+            donor_id=None, tax_year=None, receipt_type="single",
+            limit="50", offset="0",
+        ))
+        assert is_ok(by_type), by_type
+        assert by_type["total"] == 1
+        annual = call_action(comp_mod.list_tax_receipts, conn, ns(
+            company_id=env["company_id"],
+            donor_id=None, tax_year=None, receipt_type="annual_summary",
+            limit="50", offset="0",
+        ))
+        assert is_ok(annual), annual
+        assert (annual["total"], annual["tax_receipts"]) == (0, [])
+
+        by_donor = call_action(comp_mod.list_tax_receipts, conn, ns(
+            company_id=env["company_id"],
+            donor_id=env["donor_id"], tax_year=None, receipt_type=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(by_donor), by_donor
+        assert by_donor["total"] == 1
+
+        other_company = seed_company(conn)
+        seed_naming_series(conn, other_company)
+        other_donor = seed_donor(conn, other_company, "Far Donor")
+        other_donation = seed_donation(conn, other_company,
+                                       other_donor["donor_id"], "99.99")
+        assert is_ok(call_action(comp_mod.generate_tax_receipt, conn, ns(
+            company_id=other_company,
+            donor_id=other_donor["donor_id"],
+            tax_year="2026",
+            receipt_type="single",
+            donation_id=other_donation,
+            sent_method=None,
+        )))
+        reseeded = call_action(comp_mod.list_tax_receipts, conn, ns(
+            company_id=env["company_id"],
+            donor_id=None, tax_year=None, receipt_type=None,
+            limit="50", offset="0",
+        ))
+        assert is_ok(reseeded), reseeded
+        assert reseeded["total"] == 1
+        assert reseeded["tax_receipts"][0]["id"] == created["id"]
+
+    def test_list_receipts_missing_company_refuses_without_writes(self, conn, env):
+        import compliance as comp_mod
+        before = snapshot_tables(conn, ["nonprofitclaw_tax_receipt",
+                                        "nonprofitclaw_donation",
+                                        "audit_log"])
+        result = call_action(comp_mod.list_tax_receipts, conn, ns(
+            company_id=None,
+            donor_id=None, tax_year=None, receipt_type=None,
+            limit="50", offset="0",
+        ))
+        assert is_error(result)
+        assert result["message"] == "--company-id is required"
+        assert snapshot_tables(conn, ["nonprofitclaw_tax_receipt",
+                                      "nonprofitclaw_donation",
+                                      "audit_log"]) == before
 
 
 # ─────────────────────────────────────────────────────────────────────────────

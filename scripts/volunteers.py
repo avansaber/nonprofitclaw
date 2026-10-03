@@ -65,8 +65,8 @@ def add_volunteer(conn, args):
         getattr(args, "start_date", None) or str(date.today()),
         1, company_id,
     ))
+    audit(conn, SKILL, "nonprofit-add-volunteer", "nonprofitclaw_volunteer", volunteer_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-add-volunteer", volunteer_id, company_id)
     return ok({"id": volunteer_id, "naming_series": naming, "name": name})
 
 
@@ -100,8 +100,8 @@ def update_volunteer(conn, args):
     data["updated_at"] = sql_now()
     sql, params = dynamic_update("nonprofitclaw_volunteer", data, where={"id": volunteer_id})
     conn.execute(sql, params)
+    audit(conn, SKILL, "nonprofit-update-volunteer", "nonprofitclaw_volunteer", volunteer_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-update-volunteer", volunteer_id, row["company_id"])
     return ok({"id": volunteer_id, "updated": True})
 
 
@@ -223,8 +223,8 @@ def add_volunteer_shift(conn, args):
         getattr(args, "description", None),
         "scheduled", company_id,
     ))
+    audit(conn, SKILL, "nonprofit-add-volunteer-shift", "nonprofitclaw_volunteer_shift", shift_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-add-volunteer-shift", shift_id, company_id)
     return ok({"id": shift_id, "naming_series": naming, "hours": str(hours)})
 
 
@@ -344,12 +344,12 @@ def complete_volunteer_shift(conn, args):
         sql_v, params_v = dynamic_update("nonprofitclaw_volunteer", upd_vol, where={"id": volunteer_id})
         conn.execute(sql_v, params_v)
 
+        audit(conn, SKILL, "nonprofit-complete-volunteer-shift", "nonprofitclaw_volunteer_shift", shift_id)
         conn.commit()
     except Exception as e:
         conn.rollback()
         return err(f"Failed to complete shift: {e}")
 
-    audit(conn, SKILL, "nonprofit-complete-volunteer-shift", shift_id, row["company_id"])
     return ok({
         "id": shift_id,
         "completed": True,

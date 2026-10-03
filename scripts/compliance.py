@@ -85,7 +85,7 @@ def generate_tax_receipt(conn, args):
 
         dq = (
             Q.from_(_don)
-            .select(_don.id, _don.amount, _don.tax_deductible, _don.status)
+            .select(_don.id, _don.amount, _don.donation_date, _don.tax_deductible, _don.status)
             .where(_don.id == P())
             .where(_don.donor_id == P())
         )
@@ -105,23 +105,62 @@ def generate_tax_receipt(conn, args):
         if existing:
             return err(f"Tax receipt already exists for this donation: {existing['id']}")
 
+        # A donation covered by an annual summary gets no single receipt
+        year = str(donation["donation_date"])[:4]
+        cover_q = (
+            Q.from_(_receipt)
+            .select(_receipt.id)
+            .where(_receipt.donor_id == P())
+            .where(_receipt.company_id == P())
+            .where(_receipt.tax_year == P())
+            .where(_receipt.receipt_type == P())
+        )
+        covering = conn.execute(cover_q.get_sql(), (donor_id, company_id, year, "annual_summary")).fetchone()
+        if covering:
+            return err(f"Donation {donation_id} is already covered by annual summary receipt {covering['id']} for {year}")
+
     elif receipt_type == "annual_summary":
         # Annual summary receipt — aggregate all deductible donations for the year
-        total_q = (
+        dup_ann_q = (
+            Q.from_(_receipt)
+            .select(_receipt.id)
+            .where(_receipt.donor_id == P())
+            .where(_receipt.company_id == P())
+            .where(_receipt.tax_year == P())
+            .where(_receipt.receipt_type == P())
+        )
+        existing_annual = conn.execute(dup_ann_q.get_sql(), (donor_id, company_id, tax_year, "annual_summary")).fetchone()
+        if existing_annual:
+            return err(f"An annual summary receipt already exists for this donor in {tax_year}: {existing_annual['id']}")
+
+        qual_q = (
             Q.from_(_don)
-            .select(LiteralValue("SUM(CAST(amount AS NUMERIC))").as_("total"))
+            .select(_don.id, _don.amount)
             .where(_don.donor_id == P())
             .where(_don.company_id == P())
             .where(_don.tax_deductible == 1)
             .where(_don.status.notin(["refunded", "cancelled"]))
             .where(sql_date_format("donation_date", "%Y") == P())
         )
-        total_row = conn.execute(total_q.get_sql(), (donor_id, company_id, tax_year)).fetchone()
+        qualifying = conn.execute(qual_q.get_sql(), (donor_id, company_id, tax_year)).fetchall()
 
-        if not total_row["total"]:
+        if not qualifying:
             return err(f"No tax-deductible donations found for donor in {tax_year}")
 
-        amount = str(_round(_dec(total_row["total"])))
+        rec_q = (
+            Q.from_(_receipt)
+            .select(_receipt.donation_id)
+            .where(_receipt.donor_id == P())
+            .where(_receipt.company_id == P())
+            .where(_receipt.donation_id.notnull())
+        )
+        receipted = {r["donation_id"] for r in conn.execute(rec_q.get_sql(), (donor_id, company_id)).fetchall()}
+        unreceipted = [q for q in qualifying if q["id"] not in receipted]
+        if not unreceipted:
+            return err(f"Every tax-deductible donation for this donor in {tax_year} already has its own receipt")
+
+        total = sum((_dec(q["amount"]) for q in unreceipted), Decimal("0"))
+        amount = str(_round(total))
         donation_id = None  # No single donation for annual summary
     else:
         return err(f"Invalid receipt_type: {receipt_type}")
@@ -148,8 +187,8 @@ def generate_tax_receipt(conn, args):
             where={"id": donation_id})
         conn.execute(sql_u, params_u)
 
+    audit(conn, SKILL, "nonprofit-generate-tax-receipt", "nonprofitclaw_tax_receipt", receipt_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-generate-tax-receipt", receipt_id, company_id)
     return ok({
         "id": receipt_id,
         "naming_series": naming,

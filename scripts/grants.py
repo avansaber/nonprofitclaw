@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NonprofitClaw grants domain — 10 actions."""
+"""NonprofitClaw grants domain — 12 actions."""
 import json
 import os
 import sys
@@ -9,12 +9,12 @@ from decimal import Decimal, ROUND_HALF_UP
 import importlib.util
 if importlib.util.find_spec("erpclaw_lib") is None:
     sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
-from erpclaw_lib.naming import get_next_name
+from erpclaw_lib.naming import get_next_name, register_prefix
 from erpclaw_lib.response import ok, err
 from erpclaw_lib.audit import audit
 
 try:
-    from erpclaw_lib.gl_posting import insert_gl_entries
+    from erpclaw_lib.gl_posting import insert_gl_entries, reverse_gl_entries
     from erpclaw_lib.query import (
         Q, P, Table, Field, fn, Order, LiteralValue,
         insert_row, update_row, dynamic_update, now,
@@ -23,12 +23,17 @@ try:
 except ImportError:
     HAS_GL = False
 
+from erpclaw_lib.query_helpers import get_fiscal_year
+
 SKILL = "nonprofitclaw"
+
+register_prefix("nonprofitclaw_grant_receipt", "NGR-")
 
 # ── Table aliases ──
 _grant = Table("nonprofitclaw_grant")
 _ge = Table("nonprofitclaw_grant_expense")
 _fund = Table("nonprofitclaw_fund")
+_receipt = Table("nonprofitclaw_grant_receipt")
 
 
 def _dec(val):
@@ -39,6 +44,50 @@ def _dec(val):
 
 def _round(val):
     return val.quantize(Decimal("0.01"), ROUND_HALF_UP)
+
+
+def _shift_fund_balance(conn, fund_id, delta):
+    ft = Table("nonprofitclaw_fund")
+    bq = Q.from_(ft).select(ft.current_balance).where(ft.id == P())
+    row = conn.execute(bq.get_sql(), (fund_id,)).fetchone()
+    old_text = row["current_balance"] if row is not None else "0"
+    if old_text is None:
+        old_text = "0"
+    new_text = str(_round(_dec(old_text) + delta))
+    upd = Q.update(ft).set(ft.current_balance, P()).set(ft.updated_at, now()).where(ft.id == P()).where(ft.current_balance == P())
+    cur = conn.execute(upd.get_sql(), (new_text, fund_id, old_text))
+    if cur.rowcount != 1:
+        raise ValueError("Concurrent change to nonprofitclaw_fund %s: current_balance is no longer %s; nothing was written" % (fund_id, old_text))
+
+
+def _exact_grant_spent(conn, grant_id):
+    ge = Table("nonprofitclaw_grant_expense")
+    aq = Q.from_(ge).select(ge.amount).where(ge.grant_id == P()).where(ge.status == "approved")
+    rows = conn.execute(aq.get_sql(), (grant_id,)).fetchall()
+    if not rows:
+        return "0"
+    total = sum((_dec(r["amount"]) for r in rows), Decimal("0"))
+    return str(_round(total))
+
+
+def _guarded_grant_totals(conn, grant_id, old_spent, old_remaining, new_spent, new_remaining):
+    gt = Table("nonprofitclaw_grant")
+    upd = Q.update(gt).set(gt.spent_amount, P()).set(gt.remaining_amount, P()).set(gt.updated_at, now()).where(gt.id == P()).where(gt.spent_amount == P()).where(gt.remaining_amount == P())
+    cur = conn.execute(upd.get_sql(), (new_spent, new_remaining, grant_id, old_spent, old_remaining))
+    if cur.rowcount != 1:
+        raise ValueError("Concurrent change to nonprofitclaw_grant %s: spent_amount is no longer %s; nothing was written" % (grant_id, old_spent))
+
+
+def _guarded_grant_received(conn, grant_id, old_received, old_remaining, new_received, new_remaining):
+    if old_received is None:
+        old_received = "0"
+    if old_remaining is None:
+        old_remaining = "0"
+    gt = Table("nonprofitclaw_grant")
+    upd = Q.update(gt).set(gt.received_amount, P()).set(gt.remaining_amount, P()).set(gt.updated_at, now()).where(gt.id == P()).where(gt.received_amount == P()).where(gt.remaining_amount == P())
+    cur = conn.execute(upd.get_sql(), (new_received, new_remaining, grant_id, old_received, old_remaining))
+    if cur.rowcount != 1:
+        raise ValueError("Concurrent change to nonprofitclaw_grant %s: received_amount is no longer %s; nothing was written" % (grant_id, old_received))
 
 
 # ------------------------------------------------------------------
@@ -73,9 +122,12 @@ def add_grant(conn, args):
 
     fund_id = getattr(args, "fund_id", None)
     if fund_id:
-        fq = Q.from_(_fund).select(_fund.id).where(_fund.id == P())
-        if not conn.execute(fq.get_sql(), (fund_id,)).fetchone():
+        fq = Q.from_(_fund).select(_fund.id, _fund.company_id).where(_fund.id == P())
+        fund_row = conn.execute(fq.get_sql(), (fund_id,)).fetchone()
+        if not fund_row:
             return err(f"Fund {fund_id} not found")
+        if fund_row["company_id"] != company_id:
+            return err("Fund does not belong to this company")
 
     sql, _ = insert_row("nonprofitclaw_grant", {
         "id": P(), "naming_series": P(), "name": P(), "grantor_name": P(),
@@ -93,8 +145,8 @@ def add_grant(conn, args):
         getattr(args, "notes", None),
         "applied", company_id,
     ))
+    audit(conn, SKILL, "nonprofit-add-grant", "nonprofitclaw_grant", grant_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-add-grant", grant_id, company_id)
     return ok({"id": grant_id, "naming_series": naming, "name": name, "amount": str(amount)})
 
 
@@ -103,7 +155,7 @@ def update_grant(conn, args):
     if not grant_id:
         return err("--id is required")
 
-    q = Q.from_(_grant).select(_grant.id, _grant.company_id, _grant.status).where(_grant.id == P())
+    q = Q.from_(_grant).select(_grant.id, _grant.company_id, _grant.status, _grant.fund_id).where(_grant.id == P())
     row = conn.execute(q.get_sql(), (grant_id,)).fetchone()
     if not row:
         return err(f"Grant {grant_id} not found")
@@ -125,10 +177,16 @@ def update_grant(conn, args):
     fund_id = getattr(args, "fund_id", None)
     if fund_id is not None:
         if fund_id:
-            fq = Q.from_(_fund).select(_fund.id).where(_fund.id == P())
-            if not conn.execute(fq.get_sql(), (fund_id,)).fetchone():
+            fq = Q.from_(_fund).select(_fund.id, _fund.company_id).where(_fund.id == P())
+            fund_row = conn.execute(fq.get_sql(), (fund_id,)).fetchone()
+            if not fund_row:
                 return err(f"Fund {fund_id} not found")
-        data["fund_id"] = fund_id if fund_id else None
+            if fund_row["company_id"] != row["company_id"]:
+                return err("Fund does not belong to this company")
+        new_fund = fund_id if fund_id else None
+        if new_fund != row["fund_id"] and row["status"] in ("active", "completed"):
+            return err(f"Grant {grant_id} is '{row['status']}'; its fund cannot change after activation")
+        data["fund_id"] = new_fund
 
     if not data:
         return err("No fields to update")
@@ -136,8 +194,8 @@ def update_grant(conn, args):
     data["updated_at"] = now()
     sql, params = dynamic_update("nonprofitclaw_grant", data, where={"id": grant_id})
     conn.execute(sql, params)
+    audit(conn, SKILL, "nonprofit-update-grant", "nonprofitclaw_grant", grant_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-update-grant", grant_id, row["company_id"])
     return ok({"id": grant_id, "updated": True})
 
 
@@ -247,17 +305,10 @@ def activate_grant(conn, args):
 
     # If linked to a fund, update fund balance
     if row["fund_id"]:
-        ft = Table("nonprofitclaw_fund")
-        fund_upd = (
-            Q.update(ft)
-            .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS NUMERIC) + ? AS TEXT)"))
-            .set(ft.updated_at, now())
-            .where(ft.id == P())
-        )
-        conn.execute(fund_upd.get_sql(), (float(received), row["fund_id"]))
+        _shift_fund_balance(conn, row["fund_id"], received)
 
+    audit(conn, SKILL, "nonprofit-activate-grant", "nonprofitclaw_grant", grant_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-activate-grant", grant_id, row["company_id"])
     return ok({"id": grant_id, "grant_status": "active", "received_amount": str(received)})
 
 
@@ -307,8 +358,8 @@ def add_grant_expense(conn, args):
         getattr(args, "receipt_reference", None),
         "draft", company_id,
     ))
+    audit(conn, SKILL, "nonprofit-add-grant-expense", "nonprofitclaw_grant_expense", expense_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-add-grant-expense", expense_id, company_id)
     return ok({"id": expense_id, "naming_series": naming, "amount": str(amount)})
 
 
@@ -391,19 +442,43 @@ def approve_grant_expense(conn, args):
     expense_date = row["expense_date"]
     company_id = row["company_id"]
 
-    rq = Q.from_(_grant).select(_grant.remaining_amount).where(_grant.id == P())
+    rq = Q.from_(_grant).select(_grant.received_amount, _grant.fund_id, _grant.status).where(_grant.id == P())
     grant = conn.execute(rq.get_sql(), (grant_id,)).fetchone()
     if not grant:
         return err(f"Grant {grant_id} not found")
+    if grant["status"] != "active":
+        return err(f"Grant {grant_id} must be 'active' to approve an expense, currently '{grant['status']}'")
 
-    remaining = _dec(grant["remaining_amount"])
-    if amount > remaining:
-        return err(f"Expense amount ({str(amount)}) exceeds grant remaining ({str(remaining)})")
+    received = _dec(grant["received_amount"])
+    available = received - _dec(_exact_grant_spent(conn, grant_id))
+    if amount > available:
+        return err(f"Expense amount ({str(_round(amount))}) exceeds grant remaining ({str(_round(available))})")
 
-    # GL account IDs (optional — graceful degradation)
+    fund_id = grant["fund_id"]
+    if fund_id:
+        fq = Q.from_(_fund).select(_fund.name, _fund.current_balance, _fund.fund_type).where(_fund.id == P())
+        fund = conn.execute(fq.get_sql(), (fund_id,)).fetchone()
+        if fund is not None:
+            if fund["fund_type"] == "permanently_restricted":
+                return err(f"Fund {fund['name']} is permanently restricted; grant expenses cannot be paid from it")
+            fund_balance_text = fund["current_balance"] if fund["current_balance"] is not None else "0"
+            if amount > _dec(fund["current_balance"]):
+                return err(f"Expense amount ({str(_round(amount))}) exceeds the balance of fund {fund['name']} ({fund_balance_text})")
+
+    # GL account IDs (required — approval posts to the ledger)
     expense_account_id = getattr(args, "expense_account_id", None)
     cash_account_id = getattr(args, "cash_account_id", None)
     cost_center_id = getattr(args, "cost_center_id", None)
+
+    if not HAS_GL:
+        return err(f"GL posting is not available; grant expense {expense_id} cannot be approved")
+    missing = []
+    if not expense_account_id:
+        missing.append("--expense-account-id")
+    if not cash_account_id:
+        missing.append("--cash-account-id")
+    if missing:
+        return err(f"Approving grant expense {expense_id} posts it to the ledger; missing: {', '.join(missing)}")
 
     # Transaction (implicit)
     gl_entry_ids = None
@@ -412,66 +487,62 @@ def approve_grant_expense(conn, args):
             {"status": "approved"}, where={"id": expense_id})
         conn.execute(sql_a, params_a)
 
-        # --- GL Posting: DR Program Expense, CR Cash/Bank ---
-        if HAS_GL and expense_account_id and cash_account_id:
-            gl_entries = [
-                {
-                    "account_id": expense_account_id,
-                    "debit": str(_round(amount)),
-                    "credit": "0",
-                    "cost_center_id": cost_center_id,
-                },
-                {
-                    "account_id": cash_account_id,
-                    "debit": "0",
-                    "credit": str(_round(amount)),
-                    "cost_center_id": cost_center_id,
-                },
-            ]
-            try:
-                ids = insert_gl_entries(
-                    conn,
-                    gl_entries,
-                    voucher_type="grant_expense",
-                    voucher_id=expense_id,
-                    posting_date=expense_date,
-                    company_id=company_id,
-                    remarks=f"Grant expense {expense_id} for grant {grant_id}",
-                )
-                gl_entry_ids = json.dumps(ids)
-                sql_gl, params_gl = dynamic_update("nonprofitclaw_grant_expense",
-                    {"gl_entry_ids": gl_entry_ids}, where={"id": expense_id})
-                conn.execute(sql_gl, params_gl)
-            except (ValueError, Exception):
-                # GL posting failed — expense approval still proceeds
-                pass
+        # --- GL Posting: DR Program Expense, CR Cash/Bank (accounts are required) ---
+        gl_entries = [
+            {
+                "account_id": expense_account_id,
+                "debit": str(_round(amount)),
+                "credit": "0",
+                "cost_center_id": cost_center_id,
+            },
+            {
+                "account_id": cash_account_id,
+                "debit": "0",
+                "credit": str(_round(amount)),
+                "cost_center_id": cost_center_id,
+            },
+        ]
+        try:
+            ids = insert_gl_entries(
+                conn,
+                gl_entries,
+                voucher_type="journal_entry",
+                voucher_id=expense_id,
+                posting_date=expense_date,
+                company_id=company_id,
+                remarks=f"Grant expense {expense_id} for grant {grant_id}",
+            )
+            gl_entry_ids = json.dumps(ids)
+            sql_gl, params_gl = dynamic_update("nonprofitclaw_grant_expense",
+                {"gl_entry_ids": gl_entry_ids}, where={"id": expense_id})
+            conn.execute(sql_gl, params_gl)
+        except Exception as e:
+            conn.rollback()
+            err(f"GL posting failed for grant expense {expense_id}: {e}")
 
-        spent_q = (
-            Q.from_(_ge)
-            .select(LiteralValue("SUM(CAST(amount AS NUMERIC))"))
-            .where(_ge.grant_id == P())
-            .where(_ge.status == "approved")
-        )
-        new_spent = str(_round(_dec(
-            conn.execute(spent_q.get_sql(), (grant_id,)).fetchone()[0]
-        )))
+        gt0 = Table("nonprofitclaw_grant")
+        old_g = conn.execute(Q.from_(gt0).select(gt0.spent_amount, gt0.remaining_amount).where(gt0.id == P()).get_sql(), (grant_id,)).fetchone()
+        old_spent = old_g["spent_amount"] if old_g is not None else "0"
+        old_remaining = old_g["remaining_amount"] if old_g is not None else "0"
+        if old_spent is None:
+            old_spent = "0"
+        if old_remaining is None:
+            old_remaining = "0"
+        new_spent = _exact_grant_spent(conn, grant_id)
 
-        aq = Q.from_(_grant).select(_grant.amount).where(_grant.id == P())
-        grant_full = conn.execute(aq.get_sql(), (grant_id,)).fetchone()
-        new_remaining = str(_round(_dec(grant_full["amount"]) - _dec(new_spent)))
+        new_remaining = str(_round(received - _dec(new_spent)))
 
-        sql_g, params_g = dynamic_update("nonprofitclaw_grant",
-            {"spent_amount": new_spent, "remaining_amount": new_remaining,
-             "updated_at": now()},
-            where={"id": grant_id})
-        conn.execute(sql_g, params_g)
+        _guarded_grant_totals(conn, grant_id, old_spent, old_remaining, new_spent, new_remaining)
 
+        if fund_id:
+            _shift_fund_balance(conn, fund_id, -amount)
+
+        audit(conn, SKILL, "nonprofit-approve-grant-expense", "nonprofitclaw_grant_expense", expense_id)
         conn.commit()
     except Exception as e:
         conn.rollback()
         return err(f"Approval failed: {e}")
 
-    audit(conn, SKILL, "nonprofit-approve-grant-expense", expense_id, company_id)
     result = {
         "id": expense_id,
         "approved": True,
@@ -482,6 +553,37 @@ def approve_grant_expense(conn, args):
     if gl_entry_ids:
         result["gl_entry_ids"] = json.loads(gl_entry_ids)
     return ok(result)
+
+
+def reject_grant_expense(conn, args):
+    expense_id = getattr(args, "id", None)
+    if not expense_id:
+        return err("--id is required")
+
+    q = Q.from_(_ge).select(_ge.star).where(_ge.id == P())
+    row = conn.execute(q.get_sql(), (expense_id,)).fetchone()
+    if not row:
+        return err(f"Grant expense {expense_id} not found")
+    old_status = row["status"]
+    if old_status == "approved":
+        return err(f"Grant expense {expense_id} is approved; an approved expense cannot be rejected")
+    if old_status == "rejected":
+        return err(f"Grant expense {expense_id} is already rejected")
+
+    reason = getattr(args, "reason", None) or None
+    amount = row["amount"]
+    grant_id = row["grant_id"]
+
+    upd = Q.update(_ge).set(_ge.status, P()).where(_ge.id == P()).where(_ge.status == P())
+    cur = conn.execute(upd.get_sql(), ("rejected", expense_id, old_status))
+    if cur.rowcount != 1:
+        conn.rollback()
+        return err(f"Grant expense {expense_id} changed while it was being rejected; nothing was written")
+
+    audit(conn, SKILL, "nonprofit-reject-grant-expense", "nonprofitclaw_grant_expense", expense_id,
+          old_values={"status": old_status}, new_values={"status": "rejected", "reason": reason})
+    conn.commit()
+    return ok({"id": expense_id, "status": "rejected", "amount": str(amount), "grant_id": grant_id})
 
 
 def grant_status_report(conn, args):
@@ -557,13 +659,225 @@ def close_grant(conn, args):
         {"status": final_status, "updated_at": now()},
         where={"id": grant_id})
     conn.execute(sql, params)
+    audit(conn, SKILL, "nonprofit-close-grant", "nonprofitclaw_grant", grant_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-close-grant", grant_id, row["company_id"])
     return ok({
         "id": grant_id,
         "grant_status": final_status,
         "spent_amount": row["spent_amount"],
         "remaining_amount": row["remaining_amount"],
+    })
+
+
+# ------------------------------------------------------------------
+# Grant receipts
+# ------------------------------------------------------------------
+
+def record_grant_receipt(conn, args):
+    grant_id = getattr(args, "grant_id", None)
+    if not grant_id:
+        return err("--grant-id is required")
+    company_id = getattr(args, "company_id", None)
+    if not company_id:
+        return err("--company-id is required")
+
+    gq = Q.from_(_grant).select(_grant.star).where(_grant.id == P())
+    grant = conn.execute(gq.get_sql(), (grant_id,)).fetchone()
+    if not grant:
+        return err(f"Grant {grant_id} not found")
+    if grant["company_id"] != company_id:
+        return err("Grant does not belong to this company")
+    if grant["status"] not in ("active", "completed"):
+        return err(f"Grant must be 'active' or 'completed' to record a receipt, currently '{grant['status']}'")
+
+    amount_str = getattr(args, "amount", None)
+    if not amount_str:
+        return err("--amount is required")
+    amount = _round(_dec(amount_str))
+    if amount <= Decimal("0"):
+        return err("Amount must be positive")
+
+    receipt_date = getattr(args, "receipt_date", None)
+    if not receipt_date:
+        return err("--receipt-date is required")
+
+    if not HAS_GL:
+        return err("GL posting is not available; grant receipt cannot be recorded")
+
+    cash_account_id = getattr(args, "cash_account_id", None)
+    revenue_account_id = getattr(args, "revenue_account_id", None)
+    missing = []
+    if not cash_account_id:
+        missing.append("--cash-account-id")
+    if not revenue_account_id:
+        missing.append("--revenue-account-id")
+    if missing:
+        return err(f"Recording a grant receipt posts it to the ledger; missing: {', '.join(missing)}")
+
+    award = _dec(grant["amount"])
+    old_received_text = grant["received_amount"]
+    if old_received_text is None:
+        old_received_text = "0"
+    old_remaining_text = grant["remaining_amount"]
+    if old_remaining_text is None:
+        old_remaining_text = "0"
+    old_received = _dec(old_received_text)
+    available = award - old_received
+    if amount > available:
+        return err(f"Receipt amount ({str(_round(amount))}) exceeds the grant's award less received ({str(_round(available))})")
+
+    cost_center_id = getattr(args, "cost_center_id", None)
+    reference = getattr(args, "reference", None)
+    fund_id = grant["fund_id"]
+    amount_text = str(_round(amount))
+    gl_entry_ids = None
+    try:
+        receipt_id = str(uuid.uuid4())
+        naming = get_next_name(conn, "nonprofitclaw_grant_receipt", company_id=company_id)
+        sql, _ = insert_row("nonprofitclaw_grant_receipt", {
+            "id": P(), "naming_series": P(), "grant_id": P(), "fund_id": P(),
+            "receipt_date": P(), "amount": P(), "reference": P(),
+            "cash_account_id": P(), "credit_account_id": P(),
+            "cost_center_id": P(), "status": P(), "company_id": P(),
+        })
+        conn.execute(sql, (
+            receipt_id, naming, grant_id, fund_id,
+            receipt_date, amount_text, reference,
+            cash_account_id, revenue_account_id,
+            cost_center_id, "received", company_id,
+        ))
+
+        # --- GL Posting: DR Cash/Bank, CR the credit account (caller's choice) ---
+        gl_entries = [
+            {
+                "account_id": cash_account_id,
+                "debit": amount_text,
+                "credit": "0",
+                "cost_center_id": cost_center_id,
+            },
+            {
+                "account_id": revenue_account_id,
+                "debit": "0",
+                "credit": amount_text,
+                "cost_center_id": cost_center_id,
+            },
+        ]
+        try:
+            ids = insert_gl_entries(
+                conn,
+                gl_entries,
+                voucher_type="journal_entry",
+                voucher_id=receipt_id,
+                posting_date=receipt_date,
+                company_id=company_id,
+                remarks=f"Grant receipt {naming} for grant {grant_id}",
+            )
+            gl_entry_ids = json.dumps(ids)
+            sql_gl, params_gl = dynamic_update("nonprofitclaw_grant_receipt",
+                {"gl_entry_ids": gl_entry_ids}, where={"id": receipt_id})
+            conn.execute(sql_gl, params_gl)
+        except Exception as e:
+            conn.rollback()
+            err(f"GL posting failed for grant receipt {naming}: {e}")
+
+        new_received = str(_round(old_received + amount))
+        new_remaining = str(_round(_dec(new_received) - _dec(_exact_grant_spent(conn, grant_id))))
+        _guarded_grant_received(conn, grant_id, old_received_text, old_remaining_text, new_received, new_remaining)
+
+        if fund_id:
+            _shift_fund_balance(conn, fund_id, amount)
+
+        audit(conn, SKILL, "nonprofit-record-grant-receipt", "nonprofitclaw_grant_receipt", receipt_id,
+            new_values={"grant_id": grant_id, "amount": amount_text, "receipt_date": receipt_date})
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return err(f"Recording grant receipt failed: {e}")
+
+    return ok({
+        "id": receipt_id,
+        "naming_series": naming,
+        "grant_id": grant_id,
+        "amount": amount_text,
+        "grant_received": new_received,
+        "grant_remaining": new_remaining,
+        "gl_entry_ids": json.loads(gl_entry_ids),
+    })
+
+
+def cancel_grant_receipt(conn, args):
+    receipt_id = getattr(args, "id", None)
+    if not receipt_id:
+        return err("--id is required")
+
+    rq = Q.from_(_receipt).select(_receipt.star).where(_receipt.id == P())
+    row = conn.execute(rq.get_sql(), (receipt_id,)).fetchone()
+    if not row:
+        return err(f"Grant receipt {receipt_id} not found")
+    if row["status"] == "cancelled":
+        return err(f"Grant receipt {receipt_id} is already cancelled")
+    if not HAS_GL:
+        return err(f"GL posting is not available; grant receipt {receipt_id} cannot be cancelled")
+
+    grant_id = row["grant_id"]
+    receipt_date = row["receipt_date"]
+    receipt_amount = _dec(row["amount"])
+
+    gq = Q.from_(_grant).select(_grant.received_amount, _grant.remaining_amount).where(_grant.id == P())
+    grow = conn.execute(gq.get_sql(), (grant_id,)).fetchone()
+    old_received_text = grow["received_amount"] if grow is not None else "0"
+    if old_received_text is None:
+        old_received_text = "0"
+    old_remaining_text = grow["remaining_amount"] if grow is not None else "0"
+    if old_remaining_text is None:
+        old_remaining_text = "0"
+
+    if get_fiscal_year(conn, receipt_date, company_id=row["company_id"]) is None:
+        return err(f"Cannot cancel grant receipt {receipt_id}: no open fiscal year covers its date {receipt_date}")
+
+    new_received = str(_round(_dec(old_received_text) - receipt_amount))
+    spent = _exact_grant_spent(conn, grant_id)
+    if _dec(spent) > _dec(new_received):
+        return err(f"Cancelling grant receipt {receipt_id} would leave grant {grant_id} with approved expenses ({str(_round(_dec(spent)))}) above its receipts ({new_received})")
+
+    new_remaining = str(_round(_dec(new_received) - _dec(spent)))
+    fund_id = row["fund_id"]
+    reversal_ids = None
+    try:
+        upd = Q.update(_receipt).set(_receipt.status, P()).set(_receipt.cancelled_at, now()).set(_receipt.updated_at, now()).where(_receipt.id == P()).where(_receipt.status == P())
+        cur = conn.execute(upd.get_sql(), ("cancelled", receipt_id, "received"))
+        if cur.rowcount != 1:
+            raise ValueError("Concurrent change to nonprofitclaw_grant_receipt %s: status is no longer received; nothing was written" % receipt_id)
+
+        try:
+            reversal_ids = reverse_gl_entries(
+                conn,
+                voucher_type="journal_entry",
+                voucher_id=receipt_id,
+                posting_date=receipt_date,
+            )
+        except Exception as e:
+            conn.rollback()
+            err(f"GL reversal failed for grant receipt {receipt_id}: {e}")
+
+        _guarded_grant_received(conn, grant_id, old_received_text, old_remaining_text, new_received, new_remaining)
+
+        if fund_id:
+            _shift_fund_balance(conn, fund_id, -receipt_amount)
+
+        audit(conn, SKILL, "nonprofit-cancel-grant-receipt", "nonprofitclaw_grant_receipt", receipt_id,
+            old_values={"status": "received"}, new_values={"status": "cancelled"})
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return err(f"Cancelling grant receipt failed: {e}")
+
+    return ok({
+        "id": receipt_id,
+        "receipt_status": "cancelled",
+        "grant_received": new_received,
+        "grant_remaining": new_remaining,
+        "reversal_gl_entry_ids": reversal_ids,
     })
 
 
@@ -576,6 +890,9 @@ ACTIONS = {
     "nonprofit-add-grant-expense": add_grant_expense,
     "nonprofit-list-grant-expenses": list_grant_expenses,
     "nonprofit-approve-grant-expense": approve_grant_expense,
+    "nonprofit-reject-grant-expense": reject_grant_expense,
     "nonprofit-grant-status-report": grant_status_report,
     "nonprofit-close-grant": close_grant,
+    "nonprofit-record-grant-receipt": record_grant_receipt,
+    "nonprofit-cancel-grant-receipt": cancel_grant_receipt,
 }

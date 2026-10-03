@@ -1,7 +1,7 @@
 ---
 name: nonprofitclaw
 version: 1.0.1
-description: Non-Profit Management -- 57 actions across 7 domains. Donor management, donations, pledges, fund accounting, grants, volunteers, campaigns, tax receipts, and compliance.
+description: Non-Profit Management -- 60 actions across 7 domains. Donor management, donations, pledges, fund accounting, grants, volunteers, campaigns, tax receipts, and compliance.
 author: AvanSaber
 homepage: https://github.com/avansaber/nonprofitclaw
 source: https://github.com/avansaber/nonprofitclaw
@@ -47,7 +47,7 @@ python3 {baseDir}/scripts/db_query.py --action status
 --action nonprofit-generate-tax-receipt --donation-id {id}
 ```
 
-## All 57 Actions
+## All 58 Actions
 
 ### Donors & Donations (14 actions)
 | Action | Description |
@@ -84,9 +84,9 @@ python3 {baseDir}/scripts/db_query.py --action status
 | `nonprofit-get-fund` | Get fund details |
 | `nonprofit-list-funds` | List funds |
 | `nonprofit-add-fund-transfer` | Transfer between funds |
-| `nonprofit-approve-fund-transfer` | Approve fund transfer |
+| `nonprofit-approve-fund-transfer` | Approve fund transfer; refuses a permanently restricted source fund |
 
-### Grants (8 actions)
+### Grants (10 actions)
 | Action | Description |
 |--------|-------------|
 | `nonprofit-add-grant` | Create grant |
@@ -96,7 +96,10 @@ python3 {baseDir}/scripts/db_query.py --action status
 | `nonprofit-activate-grant` | Activate grant |
 | `nonprofit-close-grant` | Close grant |
 | `nonprofit-add-grant-expense` | Record grant expense |
-| `nonprofit-approve-grant-expense` | Approve grant expense |
+| `nonprofit-approve-grant-expense` | Approve grant expense (posts DR expense / CR cash; needs --expense-account-id, --cash-account-id and, for an expense account, --cost-center-id) |
+| `nonprofit-record-grant-receipt` | Record money received on an active or completed grant: posts DR cash / CR the credit account; needs --grant-id, --company-id, --amount, --receipt-date, --cash-account-id, --revenue-account-id (the account credited) and, for an income account, --cost-center-id; optional --reference; refused above the award less what is already received (a grant activated without --amount 0.00 has already recorded its award as received) |
+| `nonprofit-cancel-grant-receipt` | Cancel a grant receipt by --id: reverses its ledger rows and lowers the grant and fund by it; refused when approved expenses would exceed what remains received |
+| `nonprofit-reject-grant-expense` | Reject a draft grant expense (--id, optional --reason); no GL; unblocks close-grant |
 
 ### Volunteers (6 actions)
 | Action | Description |
@@ -125,7 +128,7 @@ python3 {baseDir}/scripts/db_query.py --action status
 | `nonprofit-get-program` | Get program details |
 | `nonprofit-list-programs` | List programs |
 
-### Reports & Analytics (9 actions)
+### Reports & Analytics (10 actions)
 | Action | Description |
 |--------|-------------|
 | `nonprofit-donor-giving-history` | Donor giving history |
@@ -137,6 +140,7 @@ python3 {baseDir}/scripts/db_query.py --action status
 | `nonprofit-list-grant-expenses` | List grant expenses |
 | `nonprofit-list-volunteer-shifts` | List volunteer shifts |
 | `nonprofit-update-program-outcomes` | Update program outcomes |
+| `nonprofit-fund-balance-reconcile` | Lists funds whose stored balance differs from their recorded donations, grant receipts, transfers and approved grant expenses; writes nothing |
 
 ## Technical Details (Tier 3)
 **Tables:** All use `nonprofitclaw_` prefix. **Script:** `scripts/db_query.py` routes to 7 modules. **Data:** Money=TEXT(Decimal), IDs=TEXT(UUID4). **Fund types:** unrestricted, temporarily_restricted, permanently_restricted, endowment.

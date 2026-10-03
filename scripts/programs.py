@@ -78,8 +78,8 @@ def add_program(conn, args):
         getattr(args, "outcome_metrics", None),
         1, company_id,
     ))
+    audit(conn, SKILL, "nonprofit-add-program", "nonprofitclaw_program", program_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-add-program", program_id, company_id)
     return ok({"id": program_id, "naming_series": naming, "name": name})
 
 
@@ -129,8 +129,8 @@ def update_program(conn, args):
     data["updated_at"] = sql_now()
     sql, params = dynamic_update("nonprofitclaw_program", data, where={"id": program_id})
     conn.execute(sql, params)
+    audit(conn, SKILL, "nonprofit-update-program", "nonprofitclaw_program", program_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-update-program", program_id, row["company_id"])
     return ok({"id": program_id, "updated": True})
 
 
@@ -248,8 +248,8 @@ def update_program_outcomes(conn, args):
     data["updated_at"] = sql_now()
     sql, params = dynamic_update("nonprofitclaw_program", data, where={"id": program_id})
     conn.execute(sql, params)
+    audit(conn, SKILL, "nonprofit-update-program-outcomes", "nonprofitclaw_program", program_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-update-program-outcomes", program_id, row["company_id"])
     return ok({"id": program_id, "outcomes_updated": True})
 
 

@@ -18,7 +18,8 @@ from decimal import Decimal
 from unittest.mock import patch, MagicMock
 from nonprofit_helpers import (
     call_action, ns, is_error, is_ok, load_db_query,
-    seed_donor, seed_fund, seed_campaign, seed_donation, seed_customer, _uuid,
+    seed_donor, seed_fund, seed_campaign, seed_donation, seed_customer,
+    snapshot_tables, _uuid,
 )
 
 mod = load_db_query()
@@ -489,6 +490,84 @@ class TestDonorGivingHistory:
             donor_id="bad-id",
         ))
         assert is_error(result)
+
+
+class TestImportDonors:
+    """Behaviour of nonprofit-import-donors, read back from the database.
+
+    FINDING (deliberately not fixed): nonprofit-import-donors is a stub. It
+    returns ok with imported 0 and writes nothing to any table: no customer
+    row, no nonprofitclaw_donor_ext row, no naming-series increment, no audit
+    entry. These tests pin that real behaviour so a future implementation has
+    a tripwire to break. The action validates none of its input (it ignores
+    its arguments entirely, not even --company-id), so no refusal case can be
+    written for it without a production change; saying so here per the task
+    rather than reaching for one.
+
+    nonprofit-import-donors never posts to the general ledger (the stub has
+    no gl_entry path at all), so this asserts stored rows, never ledger legs;
+    a later reader must not add a balanced-legs assertion here.
+    """
+
+    _TABLES = [
+        "nonprofitclaw_donor_ext",
+        "nonprofitclaw_donation",
+        "nonprofitclaw_fund",
+        "nonprofitclaw_fund_transfer",
+        "nonprofitclaw_grant",
+        "nonprofitclaw_grant_expense",
+        "nonprofitclaw_program",
+        "nonprofitclaw_volunteer",
+        "nonprofitclaw_volunteer_shift",
+        "nonprofitclaw_pledge",
+        "nonprofitclaw_campaign",
+        "nonprofitclaw_tax_receipt",
+        "customer",
+        "naming_series",
+        "audit_log",
+    ]
+
+    def test_import_donors_writes_nothing(self, conn, env):
+        import donors as donors_mod
+        donors_before = conn.execute(
+            "SELECT COUNT(*) FROM nonprofitclaw_donor_ext").fetchone()[0]
+        customers_before = conn.execute(
+            "SELECT COUNT(*) FROM customer").fetchone()[0]
+        before = snapshot_tables(conn, self._TABLES)
+
+        result = call_action(donors_mod.import_donors, conn, ns(
+            company_id=env["company_id"],
+        ))
+        assert is_ok(result), result
+        assert result["imported"] == 0
+
+        assert conn.execute(
+            "SELECT COUNT(*) FROM nonprofitclaw_donor_ext").fetchone()[0] == \
+            donors_before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM customer").fetchone()[0] == customers_before
+        assert snapshot_tables(conn, self._TABLES) == before
+
+    def test_import_donors_message_is_truthful(self, conn, env):
+        import donors as donors_mod
+        before = snapshot_tables(conn, self._TABLES)
+        result = call_action(donors_mod.import_donors, conn, ns(
+            company_id=env["company_id"],
+        ))
+        assert is_ok(result), result
+        assert result["imported"] == 0
+        assert "CSV" in result["message"]
+        assert snapshot_tables(conn, self._TABLES) == before
+
+    def test_import_donors_ignores_even_missing_company(self, conn, env):
+        import donors as donors_mod
+        before = snapshot_tables(conn, self._TABLES)
+        result = call_action(donors_mod.import_donors, conn, ns(
+            company_id=None,
+        ))
+        assert is_ok(result), result
+        assert result["imported"] == 0
+        assert snapshot_tables(conn, self._TABLES) == before
 
 
 class TestMergeDonors:

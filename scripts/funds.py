@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NonprofitClaw funds domain — 8 actions."""
+"""NonprofitClaw funds domain — 9 actions."""
 import os
 import sys
 import uuid
@@ -22,6 +22,9 @@ SKILL = "nonprofitclaw"
 _fund = Table("nonprofitclaw_fund")
 _ft = Table("nonprofitclaw_fund_transfer")
 _ff = Table("nonprofitclaw_fund")  # aliased as source in transfer queries
+_don = Table("nonprofitclaw_donation")
+_grant = Table("nonprofitclaw_grant")
+_ge = Table("nonprofitclaw_grant_expense")
 
 
 def _dec(val):
@@ -32,6 +35,20 @@ def _dec(val):
 
 def _round(val):
     return val.quantize(Decimal("0.01"), ROUND_HALF_UP)
+
+
+def _shift_fund_balance(conn, fund_id, delta):
+    ft = Table("nonprofitclaw_fund")
+    bq = Q.from_(ft).select(ft.current_balance).where(ft.id == P())
+    row = conn.execute(bq.get_sql(), (fund_id,)).fetchone()
+    old_text = row["current_balance"] if row is not None else "0"
+    if old_text is None:
+        old_text = "0"
+    new_text = str(_round(_dec(old_text) + delta))
+    upd = Q.update(ft).set(ft.current_balance, P()).set(ft.updated_at, now()).where(ft.id == P()).where(ft.current_balance == P())
+    cur = conn.execute(upd.get_sql(), (new_text, fund_id, old_text))
+    if cur.rowcount != 1:
+        raise ValueError("Concurrent change to nonprofitclaw_fund %s: current_balance is no longer %s; nothing was written" % (fund_id, old_text))
 
 
 # ------------------------------------------------------------------
@@ -68,8 +85,8 @@ def add_fund(conn, args):
         getattr(args, "end_date", None),
         1, company_id,
     ))
+    audit(conn, SKILL, "nonprofit-add-fund", "nonprofitclaw_fund", fund_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-add-fund", fund_id, company_id)
     return ok({"id": fund_id, "naming_series": naming, "name": name})
 
 
@@ -78,10 +95,15 @@ def update_fund(conn, args):
     if not fund_id:
         return err("--id is required")
 
-    q = Q.from_(_fund).select(_fund.id, _fund.company_id).where(_fund.id == P())
+    q = Q.from_(_fund).select(_fund.id, _fund.company_id, _fund.name, _fund.fund_type, _fund.current_balance).where(_fund.id == P())
     row = conn.execute(q.get_sql(), (fund_id,)).fetchone()
     if not row:
         return err(f"Fund {fund_id} not found")
+
+    new_type = getattr(args, "fund_type", None)
+    if new_type is not None and new_type != row["fund_type"] and _dec(row["current_balance"]) != Decimal("0"):
+        balance_text = row["current_balance"] if row["current_balance"] is not None else "0"
+        return err(f"Fund {row['name']} holds {balance_text}; its fund type cannot change while it holds money")
 
     data = {}
     for col, attr in [
@@ -107,8 +129,8 @@ def update_fund(conn, args):
     data["updated_at"] = now()
     sql, params = dynamic_update("nonprofitclaw_fund", data, where={"id": fund_id})
     conn.execute(sql, params)
+    audit(conn, SKILL, "nonprofit-update-fund", "nonprofitclaw_fund", fund_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-update-fund", fund_id, row["company_id"])
     return ok({"id": fund_id, "updated": True})
 
 
@@ -186,7 +208,7 @@ def add_fund_transfer(conn, args):
     if from_fund_id == to_fund_id:
         return err("Source and destination fund must be different")
 
-    fq = Q.from_(_fund).select(_fund.id, _fund.company_id, _fund.current_balance).where(_fund.id == P())
+    fq = Q.from_(_fund).select(_fund.id, _fund.company_id, _fund.current_balance, _fund.name, _fund.fund_type).where(_fund.id == P())
     from_fund = conn.execute(fq.get_sql(), (from_fund_id,)).fetchone()
     tq = Q.from_(_fund).select(_fund.id, _fund.company_id).where(_fund.id == P())
     to_fund = conn.execute(tq.get_sql(), (to_fund_id,)).fetchone()
@@ -196,6 +218,8 @@ def add_fund_transfer(conn, args):
         return err(f"Destination fund {to_fund_id} not found")
     if from_fund["company_id"] != company_id or to_fund["company_id"] != company_id:
         return err("Both funds must belong to the specified company")
+    if from_fund["fund_type"] == "permanently_restricted":
+        return err(f"Fund {from_fund['name']} is permanently restricted; its balance cannot be transferred")
 
     amount_str = getattr(args, "amount", None)
     if not amount_str:
@@ -218,8 +242,8 @@ def add_fund_transfer(conn, args):
         getattr(args, "reason", None),
         "draft", company_id,
     ))
+    audit(conn, SKILL, "nonprofit-add-fund-transfer", "nonprofitclaw_fund_transfer", transfer_id)
     conn.commit()
-    audit(conn, SKILL, "nonprofit-add-fund-transfer", transfer_id, company_id)
     return ok({"id": transfer_id, "naming_series": naming, "amount": str(amount)})
 
 
@@ -291,8 +315,10 @@ def approve_fund_transfer(conn, args):
     to_fund_id = row["to_fund_id"]
 
     # Check source fund has sufficient balance
-    bq = Q.from_(_fund).select(_fund.current_balance).where(_fund.id == P())
+    bq = Q.from_(_fund).select(_fund.current_balance, _fund.name, _fund.fund_type).where(_fund.id == P())
     from_fund = conn.execute(bq.get_sql(), (from_fund_id,)).fetchone()
+    if from_fund["fund_type"] == "permanently_restricted":
+        return err(f"Fund {from_fund['name']} is permanently restricted; its balance cannot be transferred")
     if _dec(from_fund["current_balance"]) < amount:
         return err(f"Insufficient balance in source fund. Available: {from_fund['current_balance']}, Required: {str(amount)}")
 
@@ -301,23 +327,10 @@ def approve_fund_transfer(conn, args):
     # Transaction (implicit)
     try:
         # Debit source fund
-        ft = Table("nonprofitclaw_fund")
-        debit_upd = (
-            Q.update(ft)
-            .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS NUMERIC) - ? AS TEXT)"))
-            .set(ft.updated_at, now())
-            .where(ft.id == P())
-        )
-        conn.execute(debit_upd.get_sql(), (str(amount), from_fund_id))
+        _shift_fund_balance(conn, from_fund_id, -amount)
 
         # Credit destination fund
-        credit_upd = (
-            Q.update(ft)
-            .set(ft.current_balance, LiteralValue("CAST(CAST(current_balance AS NUMERIC) + ? AS TEXT)"))
-            .set(ft.updated_at, now())
-            .where(ft.id == P())
-        )
-        conn.execute(credit_upd.get_sql(), (str(amount), to_fund_id))
+        _shift_fund_balance(conn, to_fund_id, amount)
 
         # Mark transfer as completed
         sql_c, params_c = dynamic_update("nonprofitclaw_fund_transfer",
@@ -325,12 +338,12 @@ def approve_fund_transfer(conn, args):
             where={"id": transfer_id})
         conn.execute(sql_c, params_c)
 
+        audit(conn, SKILL, "nonprofit-approve-fund-transfer", "nonprofitclaw_fund_transfer", transfer_id)
         conn.commit()
     except Exception as e:
         conn.rollback()
         return err(f"Approval failed: {e}")
 
-    audit(conn, SKILL, "nonprofit-approve-fund-transfer", transfer_id, row["company_id"])
     return ok({"id": transfer_id, "approved": True, "amount": str(amount)})
 
 
@@ -370,6 +383,87 @@ def fund_balance_report(conn, args):
     })
 
 
+def fund_balance_reconcile(conn, args):
+    company_id = getattr(args, "company_id", None)
+    if not company_id:
+        return err("--company-id is required")
+
+    fq = (
+        Q.from_(_fund)
+        .select(_fund.id, _fund.name, _fund.fund_type, _fund.current_balance)
+        .where(_fund.company_id == P())
+        .orderby(_fund.name)
+    )
+    funds = conn.execute(fq.get_sql(), (company_id,)).fetchall()
+
+    mismatched = []
+    for f in funds:
+        fund_id = f["id"]
+        expected = Decimal("0")
+
+        dq = (
+            Q.from_(_don)
+            .select(_don.amount)
+            .where(_don.fund_id == P())
+            .where(_don.status != P())
+            .where(_don.status != P())
+        )
+        for r in conn.execute(dq.get_sql(), (fund_id, "refunded", "cancelled")).fetchall():
+            expected += _dec(r["amount"])
+
+        gq = (
+            Q.from_(_grant)
+            .select(_grant.received_amount)
+            .where(_grant.fund_id == P())
+            .where((_grant.status == P()) | (_grant.status == P()) | (_grant.status == P()))
+        )
+        for r in conn.execute(gq.get_sql(), (fund_id, "active", "completed", "closed")).fetchall():
+            expected += _dec(r["received_amount"])
+
+        tiq = (
+            Q.from_(_ft)
+            .select(_ft.amount)
+            .where(_ft.to_fund_id == P())
+            .where(_ft.status == P())
+        )
+        for r in conn.execute(tiq.get_sql(), (fund_id, "completed")).fetchall():
+            expected += _dec(r["amount"])
+
+        toq = (
+            Q.from_(_ft)
+            .select(_ft.amount)
+            .where(_ft.from_fund_id == P())
+            .where(_ft.status == P())
+        )
+        for r in conn.execute(toq.get_sql(), (fund_id, "completed")).fetchall():
+            expected -= _dec(r["amount"])
+
+        eq = (
+            Q.from_(_ge)
+            .join(_grant)
+            .on(_ge.grant_id == _grant.id)
+            .select(_ge.amount)
+            .where(_grant.fund_id == P())
+            .where(_ge.status == P())
+        )
+        for r in conn.execute(eq.get_sql(), (fund_id, "approved")).fetchall():
+            expected -= _dec(r["amount"])
+
+        stored_text = f["current_balance"] if f["current_balance"] is not None else "0"
+        if _dec(stored_text) != expected:
+            stored_dec = _dec(stored_text)
+            mismatched.append({
+                "id": fund_id,
+                "name": f["name"],
+                "fund_type": f["fund_type"],
+                "stored_balance": stored_text,
+                "expected_balance": str(_round(expected)),
+                "difference": str(_round(stored_dec - expected)),
+            })
+
+    return ok({"funds": mismatched, "mismatched": len(mismatched)})
+
+
 ACTIONS = {
     "nonprofit-add-fund": add_fund,
     "nonprofit-update-fund": update_fund,
@@ -379,4 +473,5 @@ ACTIONS = {
     "nonprofit-list-fund-transfers": list_fund_transfers,
     "nonprofit-approve-fund-transfer": approve_fund_transfer,
     "nonprofit-fund-balance-report": fund_balance_report,
+    "nonprofit-fund-balance-reconcile": fund_balance_reconcile,
 }

@@ -168,6 +168,23 @@ def is_ok(result: dict) -> bool:
     return result.get("status") == "ok"
 
 
+def snapshot_tables(conn, tables: list) -> dict:
+    """Capture every row of the given tables for byte-identical comparisons.
+
+    Used by refusal tests: a refusal must leave the database untouched, so the
+    snapshot taken before the refused call must equal the one taken after.
+    Table names are fixed literals at the call sites, never user input.
+    """
+    snap = {}
+    for table in tables:
+        rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+        snap[table] = sorted(
+            tuple("" if value is None else str(value) for value in row)
+            for row in rows
+        )
+    return snap
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Utility
 # ──────────────────────────────────────────────────────────────────────────────
@@ -286,9 +303,10 @@ def seed_grant(conn, company_id: str, name="Community Grant",
     conn.execute(
         """INSERT INTO nonprofitclaw_grant
            (id, naming_series, name, grantor_name, grantor_type, grant_type,
-            amount, remaining_amount, status, company_id, fund_id)
-           VALUES (?, 'GRT-0001', ?, ?, 'foundation', 'project', ?, ?, ?, ?, ?)""",
-        (gid, name, grantor_name, amount, amount, status, company_id, fund_id)
+            amount, received_amount, remaining_amount, status, company_id, fund_id)
+           VALUES (?, 'GRT-0001', ?, ?, 'foundation', 'project', ?, ?, ?, ?, ?, ?)""",
+        (gid, name, grantor_name, amount, amount if status == "active" else "0",
+         amount, status, company_id, fund_id)
     )
     conn.commit()
     return gid

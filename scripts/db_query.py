@@ -2,7 +2,7 @@
 """NonprofitClaw — Non-Profit Management unified router.
 
 Routes all --action calls to the appropriate domain handler.
-58 total actions across 7 domain modules.
+60 total actions across 7 domain modules.
 """
 import argparse
 import os
@@ -14,6 +14,7 @@ if importlib.util.find_spec("erpclaw_lib") is None:
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from erpclaw_lib.db import get_connection
+from erpclaw_lib.dependencies import table_exists
 from erpclaw_lib.response import err
 from erpclaw_lib.args import SafeArgumentParser
 
@@ -40,11 +41,8 @@ ACTIONS.update(COMPLIANCE_ACTIONS)
 
 
 def check_tables(conn):
-    tables = [r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    ).fetchall()]
     for t in REQUIRED_TABLES:
-        if t not in tables:
+        if not table_exists(conn, t):
             err(f"Required table '{t}' not found. Run nonprofitclaw init_db.py first.")
 
 
@@ -134,6 +132,7 @@ def build_parser():
                                  "equipment", "supplies", "other"],
                         help="Expense category")
     parser.add_argument("--receipt-reference", dest="receipt_reference", help="Receipt reference")
+    parser.add_argument("--receipt-date", dest="receipt_date", help="Grant receipt date (YYYY-MM-DD)")
 
     # --- Program fields ---
     parser.add_argument("--budget", help="Program budget")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """NonprofitClaw schema — non-profit management tables.
 
-12 tables: donors, donations, funds and fund transfers, grants and grant
+13 tables: donors, donations, funds and fund transfers, grants, grant receipts and grant
 expenses, programs, volunteers and shifts, pledges, campaigns, tax receipts.
 
 Prerequisite: ERPClaw init_db.py must have run first (creates foundation tables).
@@ -230,6 +230,8 @@ GRANT = Table(
            ForeignKey("company.id", ondelete="RESTRICT"), nullable=False),
     Column("created_at", Text, server_default=text("CURRENT_TIMESTAMP")),
     Column("updated_at", Text, server_default=text("CURRENT_TIMESTAMP")),
+    # How the grant is funded; advance is the default and what every grant created before this column reads.
+    Column("funding_basis", Text, CheckConstraint("funding_basis IN ('advance','reimbursement')", name="ck_nonprofitclaw_grant_funding_basis"), nullable=False, server_default=text("'advance'")),
     CheckConstraint(
         "grantor_type IN ('foundation','government','corporate','individual',"
         "'other')",
@@ -282,6 +284,37 @@ GRANT_EXPENSE = Table(
 )
 
 Index("idx_nonprofitclaw_gexp_grant", GRANT_EXPENSE.c.grant_id)
+
+# ---------------------------------------------------------------------------
+# 6b. nonprofitclaw_grant_receipt
+#
+# One row per amount received on a grant; credit_account_id is the account the
+# receipt credits (the record action's --revenue-account-id), the caller's choice
+# (contribution revenue, a refundable-advance liability, or grants receivable);
+# cancel reverses, never edits; reference is the grantor's payment reference.
+# ---------------------------------------------------------------------------
+GRANT_RECEIPT = Table(
+    "nonprofitclaw_grant_receipt", METADATA,
+    Column("id", Text, primary_key=True, nullable=True),
+    Column("naming_series", Text),
+    Column("grant_id", Text, ForeignKey("nonprofitclaw_grant.id", ondelete="RESTRICT"), nullable=False),
+    Column("fund_id", Text, ForeignKey("nonprofitclaw_fund.id", ondelete="RESTRICT")),
+    Column("receipt_date", Text, nullable=False),
+    Column("amount", Text, nullable=False),
+    Column("reference", Text),
+    Column("cash_account_id", Text, nullable=False),
+    Column("credit_account_id", Text, nullable=False),
+    Column("cost_center_id", Text),
+    Column("gl_entry_ids", Text),
+    Column("status", Text, nullable=False, server_default=text("'received'")),
+    Column("cancelled_at", Text),
+    Column("company_id", Text, ForeignKey("company.id", ondelete="RESTRICT"), nullable=False),
+    Column("created_at", Text, server_default=text("CURRENT_TIMESTAMP")),
+    Column("updated_at", Text, server_default=text("CURRENT_TIMESTAMP")),
+    CheckConstraint("status IN ('received','cancelled')", name="ck_nonprofitclaw_grant_receipt_status"),
+)
+Index("idx_nonprofitclaw_grant_receipt_grant", GRANT_RECEIPT.c.grant_id)
+Index("idx_nonprofitclaw_grant_receipt_company", GRANT_RECEIPT.c.company_id)
 
 # ---------------------------------------------------------------------------
 # 7. nonprofitclaw_program
