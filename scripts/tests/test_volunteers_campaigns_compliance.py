@@ -34,6 +34,7 @@ import pytest
 from decimal import Decimal
 from nonprofit_helpers import (
     call_action, ns, is_error, is_ok, load_db_query,
+    get_conn, init_all_tables,
     seed_company, seed_volunteer, seed_program, seed_campaign, seed_donor,
     seed_donation, seed_fund, seed_naming_series, snapshot_tables, _uuid,
 )
@@ -1159,3 +1160,336 @@ class TestModuleStatus:
             company_id=None,
         ))
         assert is_error(result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Donor substantiation and split receipts v1 (floor-o061)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDonorSubstantiationSplitReceipts:
+    def _add_donation(self, conn, env, amount, goods_fv=None, goods_desc=None,
+                      in_kind_fv=None):
+        add = mod.ACTIONS["nonprofit-add-donation"]
+        return call_action(add, conn, ns(
+            company_id=env["company_id"],
+            donor_id=env["donor_id"],
+            amount=amount,
+            in_kind_fair_value=in_kind_fv,
+            goods_services_fair_value=goods_fv,
+            goods_services_description=goods_desc,
+        ))
+
+    def _receipt(self, conn, env, donation_id, tax_year="2026"):
+        gen = mod.ACTIONS["nonprofit-generate-tax-receipt"]
+        return call_action(gen, conn, ns(
+            company_id=env["company_id"],
+            donor_id=env["donor_id"],
+            tax_year=tax_year,
+            receipt_type="single",
+            donation_id=donation_id,
+            sent_method=None,
+        ))
+
+    def test_split_receipt_deductible_and_both_statements(self, conn, env):
+        created = self._add_donation(conn, env, "500.00", "125.25", "Gala dinner")
+        assert is_ok(created), created
+        don_row = conn.execute(
+            "SELECT amount, goods_services_fair_value, goods_services_description,"
+            " in_kind_fair_value FROM nonprofitclaw_donation WHERE id=?",
+            (created["id"],)).fetchone()
+        assert don_row["amount"] == "500.00"
+        assert don_row["goods_services_fair_value"] == "125.25"
+        assert don_row["goods_services_description"] == "Gala dinner"
+        assert Decimal(don_row["goods_services_fair_value"]) == Decimal("125.25")
+
+        result = self._receipt(conn, env, created["id"])
+        assert is_ok(result), result
+        assert result["deductible_amount"] == "374.75"
+        assert Decimal(result["deductible_amount"]) == Decimal("374.75")
+        assert result["goods_services_fair_value"] == "125.25"
+        assert result["goods_services_description"] == "Gala dinner"
+        assert result["goods_services_provided"] is True
+        joined = " ".join(result["statements"]).lower()
+        assert "quid pro quo" in joined
+        assert "only the excess" in joined
+        assert "deductible" in joined
+        assert "acknowledgment" in joined
+
+        row = conn.execute(
+            "SELECT amount, deductible_amount, goods_services_fair_value,"
+            " goods_services_description, statements FROM nonprofitclaw_tax_receipt"
+            " WHERE id=?", (result["id"],)).fetchone()
+        assert row["deductible_amount"] == "374.75"
+        assert Decimal(row["deductible_amount"]) == Decimal("374.75")
+        assert row["goods_services_fair_value"] == "125.25"
+        assert row["goods_services_description"] == "Gala dinner"
+        import json as _json
+        stored = _json.loads(row["statements"])
+        assert stored == result["statements"]
+        assert len(stored) == 2
+
+    def test_acknowledgment_none_provided(self, conn, env):
+        created = self._add_donation(conn, env, "250.00")
+        assert is_ok(created), created
+        result = self._receipt(conn, env, created["id"])
+        assert is_ok(result), result
+        assert result["deductible_amount"] == "250.00"
+        assert result["goods_services_provided"] is False
+        assert len(result["statements"]) == 1
+        assert "no goods or services were provided" in result["statements"][0].lower()
+        row = conn.execute(
+            "SELECT deductible_amount, statements FROM nonprofitclaw_tax_receipt WHERE id=?",
+            (result["id"],)).fetchone()
+        assert row["deductible_amount"] == "250.00"
+
+    def test_75_does_not_cross_quid_threshold(self, conn, env):
+        created = self._add_donation(conn, env, "75.00", "10.00", "Coffee mug")
+        assert is_ok(created), created
+        result = self._receipt(conn, env, created["id"])
+        assert is_ok(result), result
+        assert result["deductible_amount"] == "65.00"
+        assert result["statements"] == []
+
+    def test_negative_fair_value_refuses_without_writes(self, conn, env):
+        before = snapshot_tables(conn, ["nonprofitclaw_donation",
+                                        "nonprofitclaw_tax_receipt", "audit_log"])
+        result = self._add_donation(conn, env, "500.00", "-5.00", "Bad value")
+        assert is_error(result)
+        assert snapshot_tables(conn, ["nonprofitclaw_donation",
+                                      "nonprofitclaw_tax_receipt",
+                                      "audit_log"]) == before
+
+    def test_fair_value_above_amount_refuses_without_writes(self, conn, env):
+        before = snapshot_tables(conn, ["nonprofitclaw_donation",
+                                        "nonprofitclaw_tax_receipt", "audit_log"])
+        result = self._add_donation(conn, env, "100.00", "125.25", "Too much")
+        assert is_error(result)
+        assert snapshot_tables(conn, ["nonprofitclaw_donation",
+                                      "nonprofitclaw_tax_receipt",
+                                      "audit_log"]) == before
+
+    def test_negative_in_kind_refuses_without_writes(self, conn, env):
+        before = snapshot_tables(conn, ["nonprofitclaw_donation",
+                                        "nonprofitclaw_tax_receipt", "audit_log"])
+        add = mod.ACTIONS["nonprofit-add-donation"]
+        result = call_action(add, conn, ns(
+            company_id=env["company_id"],
+            donor_id=env["donor_id"],
+            amount="100.00",
+            in_kind_fair_value="-1.00",
+            goods_services_fair_value=None,
+            goods_services_description=None,
+        ))
+        assert is_error(result)
+        assert snapshot_tables(conn, ["nonprofitclaw_donation",
+                                      "nonprofitclaw_tax_receipt",
+                                      "audit_log"]) == before
+
+    def test_company_scope_and_duplicate_unchanged(self, conn, env):
+        created = self._add_donation(conn, env, "300.00", "20.00", "Books")
+        assert is_ok(created), created
+        first = self._receipt(conn, env, created["id"])
+        assert is_ok(first), first
+        assert first["deductible_amount"] == "280.00"
+        gen = mod.ACTIONS["nonprofit-generate-tax-receipt"]
+        dup = call_action(gen, conn, ns(
+            company_id=env["company_id"],
+            donor_id=env["donor_id"],
+            tax_year="2026",
+            receipt_type="single",
+            donation_id=created["id"],
+            sent_method=None,
+        ))
+        assert is_error(dup)
+        assert "already exists" in dup["message"]
+        other_company = seed_company(conn)
+        seed_naming_series(conn, other_company)
+        scoped = call_action(gen, conn, ns(
+            company_id=other_company,
+            donor_id=env["donor_id"],
+            tax_year="2026",
+            receipt_type="single",
+            donation_id=created["id"],
+            sent_method=None,
+        ))
+        assert is_error(scoped)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Donor substantiation upgrade (migration 002, floor-o061 attempt 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDonorSubstantiationMigration002Upgrade:
+    """Disposable upgrade proof: prior shape -> migration 002 twice.
+
+    Rewinds a fresh disposable database to the pre-change shape (the six
+    split-receipt columns absent), seeds one donation row and one tax receipt
+    row, runs migration 002 twice, and proves all six columns appear while
+    every value either row held is unchanged.
+    """
+
+    _DROP_DONATION_FV = (
+        "ALTER TABLE nonprofitclaw_donation DROP COLUMN goods_services_fair_value")
+    _DROP_DONATION_DESC = (
+        "ALTER TABLE nonprofitclaw_donation DROP COLUMN goods_services_description")
+    _DROP_RECEIPT_DED = (
+        "ALTER TABLE nonprofitclaw_tax_receipt DROP COLUMN deductible_amount")
+    _DROP_RECEIPT_FV = (
+        "ALTER TABLE nonprofitclaw_tax_receipt DROP COLUMN goods_services_fair_value")
+    _DROP_RECEIPT_DESC = (
+        "ALTER TABLE nonprofitclaw_tax_receipt DROP COLUMN goods_services_description")
+    _DROP_RECEIPT_STMTS = (
+        "ALTER TABLE nonprofitclaw_tax_receipt DROP COLUMN statements")
+
+    DONATION_ADDED = [
+        "nonprofitclaw_donation.goods_services_fair_value",
+        "nonprofitclaw_donation.goods_services_description",
+    ]
+    RECEIPT_ADDED = [
+        "nonprofitclaw_tax_receipt.deductible_amount",
+        "nonprofitclaw_tax_receipt.goods_services_fair_value",
+        "nonprofitclaw_tax_receipt.goods_services_description",
+        "nonprofitclaw_tax_receipt.statements",
+    ]
+
+    def _load_migration(self):
+        import importlib.util
+        import os
+        path = os.path.join(
+            os.path.normpath(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "..", "migrations")),
+            "002_donor_substantiation_columns.py")
+        spec = importlib.util.spec_from_file_location(
+            "nonprofitclaw_migration_002", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _rewind(self, db_path):
+        import nonprofit_helpers  # noqa: F401, binds erpclaw_lib to the tree
+        from erpclaw_lib import seam
+        from erpclaw_lib.db import get_connection
+        for stmt in (
+                self._DROP_RECEIPT_STMTS, self._DROP_RECEIPT_DESC,
+                self._DROP_RECEIPT_FV, self._DROP_RECEIPT_DED,
+                self._DROP_DONATION_DESC, self._DROP_DONATION_FV):
+            conn = get_connection(db_path)
+            conn.execute(stmt)
+            conn.commit()
+            conn.close()
+        assert "goods_services_fair_value" not in seam.column_names(
+            "nonprofitclaw_donation", db_path)
+        assert "goods_services_description" not in seam.column_names(
+            "nonprofitclaw_donation", db_path)
+        for col in ("deductible_amount", "goods_services_fair_value",
+                    "goods_services_description", "statements"):
+            assert col not in seam.column_names(
+                "nonprofitclaw_tax_receipt", db_path)
+
+    def test_prior_shape_upgrades_twice_and_keeps_row_values(self, tmp_path):
+        import nonprofit_helpers  # noqa: F401, binds erpclaw_lib to the tree
+        from erpclaw_lib import seam
+        mig = self._load_migration()
+        path = str(tmp_path / "prior.sqlite")
+        init_all_tables(path)
+        self._rewind(path)
+
+        conn = get_conn(path)
+        try:
+            company_id = seed_company(conn)
+            seed_naming_series(conn, company_id)
+            donor = seed_donor(conn, company_id)
+            donor_id = donor["donor_id"]
+            donation_id = seed_donation(conn, company_id, donor_id, "500.00")
+            receipt_id = _uuid()
+            conn.execute(
+                """INSERT INTO nonprofitclaw_tax_receipt
+                   (id, naming_series, donor_id, donation_id, receipt_date,
+                    amount, tax_year, receipt_type, company_id)
+                   VALUES (?, 'TREC-0001', ?, ?, '2026-02-01', '500.00',
+                    '2026', 'single', ?)""",
+                (receipt_id, donor_id, donation_id, company_id))
+            conn.commit()
+            donation_before = dict(conn.execute(
+                "SELECT * FROM nonprofitclaw_donation WHERE id = ?",
+                (donation_id,)).fetchone())
+            receipt_before = dict(conn.execute(
+                "SELECT * FROM nonprofitclaw_tax_receipt WHERE id = ?",
+                (receipt_id,)).fetchone())
+        finally:
+            conn.close()
+
+        first = mig.run_migration(path)
+        assert sorted(first["added"]) == sorted(
+            self.DONATION_ADDED + self.RECEIPT_ADDED)
+
+        donation_cols = seam.column_names("nonprofitclaw_donation", path)
+        receipt_cols = seam.column_names("nonprofitclaw_tax_receipt", path)
+        assert "goods_services_fair_value" in donation_cols
+        assert "goods_services_description" in donation_cols
+        for col in ("deductible_amount", "goods_services_fair_value",
+                    "goods_services_description", "statements"):
+            assert col in receipt_cols
+
+        second = mig.run_migration(path)
+        assert second["added"] == []
+        assert second["tables"] == 0
+        assert second["indexes"] == 0
+        assert sorted(second["already_present"]) == sorted(
+            self.DONATION_ADDED + self.RECEIPT_ADDED)
+
+        conn = get_conn(path)
+        try:
+            donation_after = dict(conn.execute(
+                "SELECT * FROM nonprofitclaw_donation WHERE id = ?",
+                (donation_id,)).fetchone())
+            receipt_after = dict(conn.execute(
+                "SELECT * FROM nonprofitclaw_tax_receipt WHERE id = ?",
+                (receipt_id,)).fetchone())
+        finally:
+            conn.close()
+        for col in ("goods_services_fair_value", "goods_services_description"):
+            assert donation_after.pop(col) is None
+        assert donation_after == donation_before
+        for col in ("deductible_amount", "goods_services_fair_value",
+                    "goods_services_description", "statements"):
+            assert receipt_after.pop(col) is None
+        assert receipt_after == receipt_before
+
+    def test_report_only_writes_nothing(self, tmp_path):
+        import nonprofit_helpers  # noqa: F401, binds erpclaw_lib to the tree
+        from erpclaw_lib import seam
+        mig = self._load_migration()
+        path = str(tmp_path / "prior_ro.sqlite")
+        init_all_tables(path)
+        self._rewind(path)
+        result = mig.run_migration(path, report_only=True)
+        assert result["report_only"] is True
+        assert result["added"] == []
+        assert "goods_services_fair_value" not in seam.column_names(
+            "nonprofitclaw_donation", path)
+        assert "deductible_amount" not in seam.column_names(
+            "nonprofitclaw_tax_receipt", path)
+
+    def test_no_op_without_nonprofitclaw(self, tmp_path):
+        import importlib.util
+        import nonprofit_helpers  # noqa: F401, binds erpclaw_lib to the tree
+        from erpclaw_lib import seam
+        from nonprofit_helpers import INIT_SCHEMA_PATH
+        mig = self._load_migration()
+        path = str(tmp_path / "foundation.sqlite")
+        spec = importlib.util.spec_from_file_location("init_schema",
+                                                      INIT_SCHEMA_PATH)
+        foundation = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(foundation)
+        foundation.init_db(path)
+        result = mig.run_migration(path)
+        assert result["tables"] == 0
+        assert result["added"] == []
+        assert [t for t in seam.table_names(path)
+                if t.startswith("nonprofitclaw_")] == []
+
+    def test_it_declares_that_it_changes_no_data(self):
+        mig = self._load_migration()
+        assert mig.MIGRATION_DATA_CLASS == "none"

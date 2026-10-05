@@ -8,6 +8,7 @@ donations that already have their own receipt, and a donor gets at most one
 annual summary per tax year.
 """
 import uuid
+from decimal import Decimal
 
 from nonprofit_helpers import (
     call_action, is_error, is_ok, load_db_query, ns, snapshot_tables,
@@ -389,3 +390,119 @@ def test_fund_balance_reconcile_lists_only_drifted_funds(conn, env):
     missing = call_action(action, conn, ns(company_id=None))
     assert is_error(missing)
     assert missing["message"] == "--company-id is required"
+
+
+# ------------------------------------------------------------------
+# Release from donor restriction v1 (floor-o012)
+#
+# Stored vocabulary stays `temporarily_restricted` (with-donor-restrictions)
+# and `unrestricted` (without-donor-restrictions). All calls go through the
+# real action map so the router registration is covered too.
+# ------------------------------------------------------------------
+
+def _release(conn, company_id, from_fund_id, to_fund_id, amount,
+             transfer_date="2026-03-01", reason="Purpose met",
+             approved_by="Treasurer"):
+    action = load_db_query().ACTIONS["nonprofit-release-restriction"]
+    return call_action(action, conn, ns(
+        company_id=company_id, from_fund_id=from_fund_id,
+        to_fund_id=to_fund_id, amount=amount,
+        transfer_date=transfer_date, reason=reason,
+        approved_by=approved_by))
+
+
+def test_release_restriction_moves_exact_amounts_and_conserves(conn, env):
+    restricted = _add_fund(conn, env, "Building Pledges", "temporarily_restricted")
+    general = _add_fund(conn, env, "General Operating", "unrestricted")
+    _donate(conn, env, "100.10", "2026-02-01", fund_id=restricted)
+    assert _balance(conn, restricted) == "100.10"
+    assert Decimal(_balance(conn, general)) == Decimal("0")
+    before_transfers = conn.execute(
+        "SELECT COUNT(*) FROM nonprofitclaw_fund_transfer").fetchone()[0]
+
+    result = _release(conn, env["company_id"], restricted, general, "60.05")
+    assert is_ok(result), result
+    assert result["document_status"] == "completed"
+    assert result["transfer_status"] == "completed"
+    assert result["released_amount"] == "60.05"
+    assert result["amount"] == "60.05"
+    assert result["from_fund_id"] == restricted
+    assert result["to_fund_id"] == general
+
+    stored_src = _balance(conn, restricted)
+    stored_dst = _balance(conn, general)
+    assert stored_src == "40.05"
+    assert stored_dst == "60.05"
+    assert result["source_ending_balance"] == stored_src
+    assert result["destination_ending_balance"] == stored_dst
+    assert result["source_balance"] == stored_src
+    assert result["destination_balance"] == stored_dst
+
+    row = conn.execute(
+        "SELECT amount, status, from_fund_id, to_fund_id "
+        "FROM nonprofitclaw_fund_transfer WHERE id = ?",
+        (result["id"],)).fetchone()
+    assert row["amount"] == "60.05"
+    assert row["status"] == "completed"
+    assert row["from_fund_id"] == restricted
+    assert row["to_fund_id"] == general
+    assert conn.execute(
+        "SELECT COUNT(*) FROM nonprofitclaw_fund_transfer").fetchone()[0] == before_transfers + 1
+
+    assert Decimal(stored_src) + Decimal(stored_dst) == Decimal("100.10")
+
+
+def test_release_restriction_refuses_permanently_restricted_source(conn, env):
+    endow = _add_fund(conn, env, "Endowment", "permanently_restricted")
+    _donate(conn, env, "1000.00", "2026-02-01", fund_id=endow)
+    assert _balance(conn, endow) == "1000.00"
+    before = snapshot_tables(conn, SNAP)
+    refused = _release(conn, env["company_id"], endow, env["fund_id"], "100.00")
+    assert is_error(refused)
+    assert snapshot_tables(conn, SNAP) == before
+    assert _balance(conn, endow) == "1000.00"
+
+
+def test_release_restriction_refuses_restricted_destination(conn, env):
+    from nonprofit_helpers import seed_company, seed_naming_series, seed_fund
+    src = _add_fund(conn, env, "Grant Fund", "temporarily_restricted")
+    _donate(conn, env, "200.00", "2026-02-01", fund_id=src)
+    dst = _add_fund(conn, env, "Other Restricted", "temporarily_restricted")
+    before = snapshot_tables(conn, SNAP)
+    refused = _release(conn, env["company_id"], src, dst, "50.00")
+    assert is_error(refused)
+    assert snapshot_tables(conn, SNAP) == before
+    assert _balance(conn, src) == "200.00"
+    assert Decimal(_balance(conn, dst)) == Decimal("0")
+
+    other = seed_company(conn)
+    seed_naming_series(conn, other)
+    foreign = seed_fund(conn, other, "Foreign General", "unrestricted")
+    before_foreign = snapshot_tables(conn, SNAP)
+    refused_foreign = _release(conn, env["company_id"], src, foreign, "50.00")
+    assert is_error(refused_foreign)
+    assert refused_foreign["message"] == "Both funds must belong to the specified company"
+    assert snapshot_tables(conn, SNAP) == before_foreign
+    assert _balance(conn, src) == "200.00"
+
+
+def test_release_restriction_refuses_insufficient_and_nonfinite(conn, env):
+    src = _add_fund(conn, env, "Program Fund", "temporarily_restricted")
+    _donate(conn, env, "100.10", "2026-02-01", fund_id=src)
+    dst = _add_fund(conn, env, "Operating", "unrestricted")
+
+    before = snapshot_tables(conn, SNAP)
+    refused = _release(conn, env["company_id"], src, dst, "100.11")
+    assert is_error(refused)
+    assert snapshot_tables(conn, SNAP) == before
+
+    for bad in ("NaN", "Infinity", "-Infinity"):
+        snap = snapshot_tables(conn, SNAP)
+        refused_bad = _release(conn, env["company_id"], src, dst, bad)
+        assert is_error(refused_bad), bad
+        assert snapshot_tables(conn, SNAP) == snap
+
+    assert _balance(conn, src) == "100.10"
+    assert Decimal(_balance(conn, dst)) == Decimal("0")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM nonprofitclaw_fund_transfer").fetchone()[0] == 0

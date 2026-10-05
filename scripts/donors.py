@@ -447,6 +447,29 @@ def add_donation(conn, args):
     if amount <= Decimal("0"):
         return err("Amount must be positive")
 
+    try:
+        in_kind_raw = getattr(args, "in_kind_fair_value", None)
+        if in_kind_raw is not None and str(in_kind_raw).strip() != "":
+            in_kind_value = _round(_dec(str(in_kind_raw)))
+        else:
+            in_kind_value = None
+        goods_fv_raw = getattr(args, "goods_services_fair_value", None)
+        if goods_fv_raw is not None and str(goods_fv_raw).strip() != "":
+            goods_fv_value = _round(_dec(str(goods_fv_raw)))
+        else:
+            goods_fv_value = None
+    except Exception:
+        return err("Fair value must be a valid decimal amount")
+    for label, fv in (("In-kind fair value", in_kind_value), ("Goods or services fair value", goods_fv_value)):
+        if fv is not None:
+            if fv < Decimal("0"):
+                return err(f"{label} must not be negative")
+            if fv > amount:
+                return err(f"{label} must not exceed the donation amount")
+    goods_services_description = getattr(args, "goods_services_description", None)
+    if isinstance(goods_services_description, str) and goods_services_description.strip() == "":
+        goods_services_description = None
+
     donation_id = str(uuid.uuid4())
     naming = get_next_name(conn, "nonprofitclaw_donation", company_id=company_id)
     donation_date = getattr(args, "donation_date", None) or str(date.today())
@@ -484,13 +507,18 @@ def add_donation(conn, args):
             "id": P(), "naming_series": P(), "donor_id": P(), "fund_id": P(),
             "campaign_id": P(), "donation_date": P(), "amount": P(),
             "payment_method": P(), "reference": P(), "is_recurring": P(),
-            "recurrence_freq": P(), "notes": P(), "status": P(), "company_id": P(),
+            "recurrence_freq": P(), "in_kind_fair_value": P(),
+            "goods_services_fair_value": P(), "goods_services_description": P(),
+            "notes": P(), "status": P(), "company_id": P(),
         })
         conn.execute(sql, (
             donation_id, naming, donor_id, fund_id, campaign_id,
             donation_date, str(amount), payment_method,
             getattr(args, "reference", None),
             is_recurring, recurrence_freq,
+            str(in_kind_value) if in_kind_value is not None else None,
+            str(goods_fv_value) if goods_fv_value is not None else None,
+            goods_services_description,
             getattr(args, "notes", None),
             "received", company_id,
         ))

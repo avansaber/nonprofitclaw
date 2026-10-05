@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """NonprofitClaw schema — non-profit management tables.
-
-13 tables: donors, donations, funds and fund transfers, grants, grant receipts and grant
+14 tables: donors, donations, funds and fund transfers, endowment appropriations,
+grants, grant receipts and grant expenses, programs, volunteers and shifts,
+pledges, campaigns, tax receipts.
 expenses, programs, volunteers and shifts, pledges, campaigns, tax receipts.
 
 Prerequisite: ERPClaw init_db.py must have run first (creates foundation tables).
@@ -31,7 +32,7 @@ if importlib.util.find_spec("erpclaw_lib") is None:
 
 from erpclaw_lib.seam import (  # noqa: E402
     CheckConstraint, Column, ForeignKey, Index, Integer, MetaData, Table, Text,
-    provision, reference_table, text,
+    UniqueConstraint, provision, reference_table, text,
 )
 
 DEFAULT_DB_PATH = os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "data.sqlite")
@@ -107,6 +108,8 @@ DONATION = Table(
     Column("recurrence_freq", Text),
     Column("in_kind_description", Text),
     Column("in_kind_fair_value", Text),
+    Column("goods_services_fair_value", Text),
+    Column("goods_services_description", Text),
     Column("tax_deductible", Integer, nullable=False, server_default=text("1")),
     Column("receipt_sent", Integer, nullable=False, server_default=text("0")),
     Column("gl_entry_ids", Text),
@@ -201,6 +204,32 @@ FUND_TRANSFER = Table(
 )
 
 Index("idx_nonprofitclaw_ft_company", FUND_TRANSFER.c.company_id)
+
+# ---------------------------------------------------------------------------
+# 4b. nonprofitclaw_endowment_appropriation
+# ---------------------------------------------------------------------------
+ENDOWMENT_APPROPRIATION = Table(
+    "nonprofitclaw_endowment_appropriation", METADATA,
+    Column("id", Text, primary_key=True, nullable=True),
+    Column("naming_series", Text),
+    Column("company_id", Text,
+           ForeignKey("company.id", ondelete="RESTRICT"), nullable=False),
+    Column("endowment_fund_id", Text,
+           ForeignKey("nonprofitclaw_fund.id", ondelete="RESTRICT"),
+           nullable=False),
+    Column("decision_date", Text, nullable=False),
+    Column("amount", Text, nullable=False),
+    Column("decision_reference", Text, nullable=False),
+    Column("cash_account_id", Text, nullable=False),
+    Column("spendable_account_id", Text, nullable=False),
+    Column("gl_entry_ids", Text),
+    Column("created_at", Text, server_default=text("CURRENT_TIMESTAMP")),
+    UniqueConstraint("endowment_fund_id", "decision_reference"),
+)
+
+Index("idx_nonprofitclaw_eapp_company", ENDOWMENT_APPROPRIATION.c.company_id)
+Index("idx_nonprofitclaw_eapp_fund", ENDOWMENT_APPROPRIATION.c.endowment_fund_id)
+
 
 # ---------------------------------------------------------------------------
 # 5. nonprofitclaw_grant
@@ -483,6 +512,10 @@ TAX_RECEIPT = Table(
     Column("receipt_date", Text, nullable=False,
            server_default=text("CURRENT_DATE")),
     Column("amount", Text, nullable=False, server_default=text("'0'")),
+    Column("deductible_amount", Text),
+    Column("goods_services_fair_value", Text),
+    Column("goods_services_description", Text),
+    Column("statements", Text),
     Column("tax_year", Text, nullable=False),
     Column("receipt_type", Text, nullable=False, server_default=text("'single'")),
     Column("sent_date", Text),

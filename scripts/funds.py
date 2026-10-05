@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NonprofitClaw funds domain — 9 actions."""
+"""NonprofitClaw funds domain: 10 actions."""
 import os
 import sys
 import uuid
@@ -463,6 +463,122 @@ def fund_balance_reconcile(conn, args):
 
     return ok({"funds": mismatched, "mismatched": len(mismatched)})
 
+# ------------------------------------------------------------------
+# Release from donor restriction (v1)
+#
+# Stored vocabulary stays `temporarily_restricted` (with-donor-restrictions)
+# and `unrestricted` (without-donor-restrictions). One completed
+# nonprofitclaw_fund_transfer moves the released amount, with no ledger
+# posting in this v1.
+# ------------------------------------------------------------------
+
+def release_restriction(conn, args):
+    company_id = getattr(args, "company_id", None)
+    if not company_id:
+        return err("--company-id is required")
+
+    from_fund_id = getattr(args, "from_fund_id", None)
+    to_fund_id = getattr(args, "to_fund_id", None)
+    if not from_fund_id or not to_fund_id:
+        return err("--from-fund-id and --to-fund-id are required")
+    if from_fund_id == to_fund_id:
+        return err("Source and destination fund must be different")
+
+    fq = Q.from_(_fund).select(
+        _fund.id, _fund.company_id, _fund.current_balance,
+        _fund.name, _fund.fund_type,
+    ).where(_fund.id == P())
+    from_fund = conn.execute(fq.get_sql(), (from_fund_id,)).fetchone()
+    tq = Q.from_(_fund).select(
+        _fund.id, _fund.company_id, _fund.current_balance,
+        _fund.name, _fund.fund_type,
+    ).where(_fund.id == P())
+    to_fund = conn.execute(tq.get_sql(), (to_fund_id,)).fetchone()
+    if not from_fund:
+        return err(f"Source fund {from_fund_id} not found")
+    if not to_fund:
+        return err(f"Destination fund {to_fund_id} not found")
+    if from_fund["company_id"] != company_id or to_fund["company_id"] != company_id:
+        return err("Both funds must belong to the specified company")
+    if from_fund["fund_type"] != "temporarily_restricted":
+        return err(
+            f"Source fund {from_fund['name']} is {from_fund['fund_type']}; "
+            "release from restriction requires a temporarily_restricted "
+            "(with-donor-restrictions) source"
+        )
+    if to_fund["fund_type"] != "unrestricted":
+        return err(
+            f"Destination fund {to_fund['name']} is {to_fund['fund_type']}; "
+            "release from restriction requires an unrestricted "
+            "(without-donor-restrictions) destination"
+        )
+
+    amount_str = getattr(args, "amount", None)
+    if not amount_str:
+        return err("--amount is required")
+    try:
+        amount = _round(_dec(amount_str))
+    except Exception:
+        return err("Amount must be finite and positive")
+    if not amount.is_finite():
+        return err("Amount must be finite and positive")
+    if amount <= Decimal("0"):
+        return err("Amount must be positive")
+    source_text = from_fund["current_balance"] if from_fund["current_balance"] is not None else "0"
+    if amount > _dec(source_text):
+        return err(
+            f"Insufficient balance in source fund. Available: {source_text}, "
+            f"Required: {str(amount)}"
+        )
+
+    transfer_id = str(uuid.uuid4())
+    naming = get_next_name(conn, "nonprofitclaw_fund_transfer", company_id=company_id)
+    transfer_date = getattr(args, "transfer_date", None) or str(__import__("datetime").date.today())
+    reason = getattr(args, "reason", None)
+    approved_by = getattr(args, "approved_by", None)
+
+    try:
+        sql, _ = insert_row("nonprofitclaw_fund_transfer", {
+            "id": P(), "naming_series": P(), "from_fund_id": P(), "to_fund_id": P(),
+            "amount": P(), "transfer_date": P(), "reason": P(), "approved_by": P(),
+            "status": P(), "company_id": P(),
+        })
+        conn.execute(sql, (
+            transfer_id, naming, from_fund_id, to_fund_id,
+            str(amount), transfer_date, reason, approved_by,
+            "completed", company_id,
+        ))
+        _shift_fund_balance(conn, from_fund_id, -amount)
+        _shift_fund_balance(conn, to_fund_id, amount)
+        audit(conn, SKILL, "nonprofit-release-restriction",
+              "nonprofitclaw_fund_transfer", transfer_id)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return err(f"Release failed: {e}")
+
+    bal_q = Q.from_(_fund).select(_fund.current_balance).where(_fund.id == P())
+    source_end = conn.execute(bal_q.get_sql(), (from_fund_id,)).fetchone()["current_balance"]
+    dest_end = conn.execute(bal_q.get_sql(), (to_fund_id,)).fetchone()["current_balance"]
+    return ok({
+        "id": transfer_id,
+        "transfer_id": transfer_id,
+        "amount": str(amount),
+        "released_amount": str(amount),
+        "from_fund_id": from_fund_id,
+        "to_fund_id": to_fund_id,
+        "source_fund_id": from_fund_id,
+        "destination_fund_id": to_fund_id,
+        "from_fund_balance": source_end,
+        "to_fund_balance": dest_end,
+        "source_balance": source_end,
+        "destination_balance": dest_end,
+        "source_ending_balance": source_end,
+        "destination_ending_balance": dest_end,
+        "transfer_status": "completed",
+        "status": "completed",
+    })
+
 
 ACTIONS = {
     "nonprofit-add-fund": add_fund,
@@ -472,6 +588,7 @@ ACTIONS = {
     "nonprofit-add-fund-transfer": add_fund_transfer,
     "nonprofit-list-fund-transfers": list_fund_transfers,
     "nonprofit-approve-fund-transfer": approve_fund_transfer,
+    "nonprofit-release-restriction": release_restriction,
     "nonprofit-fund-balance-report": fund_balance_report,
     "nonprofit-fund-balance-reconcile": fund_balance_reconcile,
 }

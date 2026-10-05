@@ -2,7 +2,7 @@
 """NonprofitClaw — Non-Profit Management unified router.
 
 Routes all --action calls to the appropriate domain handler.
-60 total actions across 7 domain modules.
+66 total actions across 9 domain modules.
 """
 import argparse
 import os
@@ -25,6 +25,8 @@ from programs import ACTIONS as PROGRAMS_ACTIONS
 from volunteers import ACTIONS as VOLUNTEERS_ACTIONS
 from campaigns import ACTIONS as CAMPAIGNS_ACTIONS
 from compliance import ACTIONS as COMPLIANCE_ACTIONS
+from endowments import ACTIONS as ENDOWMENTS_ACTIONS
+from reports import ACTIONS as REPORTS_ACTIONS
 
 SKILL = "nonprofitclaw"
 REQUIRED_TABLES = ["company", "customer", "nonprofitclaw_donor_ext"]
@@ -38,6 +40,8 @@ ACTIONS.update(PROGRAMS_ACTIONS)
 ACTIONS.update(VOLUNTEERS_ACTIONS)
 ACTIONS.update(CAMPAIGNS_ACTIONS)
 ACTIONS.update(COMPLIANCE_ACTIONS)
+ACTIONS.update(ENDOWMENTS_ACTIONS)
+ACTIONS.update(REPORTS_ACTIONS)
 
 
 def check_tables(conn):
@@ -62,6 +66,8 @@ def build_parser():
     parser.add_argument("--volunteer-id", dest="volunteer_id", help="Volunteer ID")
     parser.add_argument("--campaign-id", dest="campaign_id", help="Campaign ID")
     parser.add_argument("--pledge-id", dest="pledge_id", help="Pledge ID")
+    parser.add_argument("--fiscal-year-id", dest="fiscal_year_id",
+                        help="Fiscal year ID for period-bound reports")
 
     # --- Merge / transfer IDs ---
     parser.add_argument("--source-donor-id", dest="source_donor_id", help="Source donor ID for merge")
@@ -98,6 +104,12 @@ def build_parser():
     parser.add_argument("--recurrence-freq", dest="recurrence_freq",
                         choices=["monthly", "quarterly", "annually"],
                         help="Recurrence frequency")
+    parser.add_argument("--in-kind-fair-value", dest="in_kind_fair_value",
+                        help="In-kind fair value (Decimal string, must not exceed --amount)")
+    parser.add_argument("--goods-services-fair-value", dest="goods_services_fair_value",
+                        help="Fair value of goods or services provided (Decimal string, must not exceed --amount)")
+    parser.add_argument("--goods-services-description", dest="goods_services_description",
+                        help="Description of goods or services provided")
 
     # --- Fund fields ---
     parser.add_argument("--fund-type", dest="fund_type",
@@ -112,6 +124,13 @@ def build_parser():
     parser.add_argument("--transfer-date", dest="transfer_date", help="Transfer date (YYYY-MM-DD)")
     parser.add_argument("--reason", help="Reason / justification")
     parser.add_argument("--approved-by", dest="approved_by", help="Approved by (name/ID)")
+
+    # Endowment appropriation fields
+    parser.add_argument("--endowment-fund-id", dest="endowment_fund_id", help="Endowment fund ID for appropriation")
+    parser.add_argument("--decision-date", dest="decision_date", help="Board decision date (YYYY-MM-DD)")
+    parser.add_argument("--decision-reference", dest="decision_reference", help="Board decision reference (idempotency key per endowment fund)")
+    parser.add_argument("--investment-account-id", dest="investment_account_id", help="Investment GL account ID (asset) for endowment appropriation")
+    parser.add_argument("--spendable-account-id", dest="spendable_account_id", help="Spendable fund balance GL account ID (equity) for endowment appropriation")
 
     # --- Grant fields ---
     parser.add_argument("--grantor-name", dest="grantor_name", help="Grantor name")
@@ -173,6 +192,12 @@ def build_parser():
                         help="Program Expense GL account ID for grant disbursements")
     parser.add_argument("--cost-center-id", dest="cost_center_id",
                         help="Cost center ID for GL postings")
+    parser.add_argument("--refundable-advance-account-id", dest="refundable_advance_account_id",
+                        help="Refundable advance (liability) GL account ID for conditional contributions")
+    parser.add_argument("--condition-text", dest="condition_text",
+                        help="Explicit donor condition text for conditional contributions")
+    parser.add_argument("--condition-met", dest="condition_met",
+                        help="Whether the donor condition was met: true or false (required, never inferred)")
 
     # --- Common filters ---
     parser.add_argument("--notes", help="Notes / comments")

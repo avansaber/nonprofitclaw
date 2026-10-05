@@ -1,7 +1,7 @@
 ---
 name: nonprofitclaw
 version: 1.0.1
-description: Non-Profit Management -- 60 actions across 7 domains. Donor management, donations, pledges, fund accounting, grants, volunteers, campaigns, tax receipts, and compliance.
+description: "Non-Profit Management: 62 actions across 9 domains. Donor management, donations, pledges, fund accounting, endowment appropriation, grants, volunteers, campaigns, tax receipts, and compliance."
 author: AvanSaber
 homepage: https://github.com/avansaber/nonprofitclaw
 source: https://github.com/avansaber/nonprofitclaw
@@ -47,7 +47,7 @@ python3 {baseDir}/scripts/db_query.py --action status
 --action nonprofit-generate-tax-receipt --donation-id {id}
 ```
 
-## All 58 Actions
+## All 61 Actions
 
 ### Donors & Donations (14 actions)
 | Action | Description |
@@ -58,12 +58,12 @@ python3 {baseDir}/scripts/db_query.py --action status
 | `nonprofit-list-donors` | List donors |
 | `nonprofit-merge-donors` | Merge duplicate donors |
 | `nonprofit-import-donors` | Import donors from CSV |
-| `nonprofit-add-donation` | Record donation |
+| `nonprofit-add-donation` | Record donation; supports --in-kind-fair-value, --goods-services-fair-value and --goods-services-description (Decimal strings, each must not be negative or exceed the donation amount); split-receipt fair values persist for substantiation |
 | `nonprofit-update-donation` | Update donation |
 | `nonprofit-get-donation` | Get donation details |
 | `nonprofit-list-donations` | List donations |
 | `nonprofit-refund-donation` | Refund donation |
-| `nonprofit-generate-tax-receipt` | Generate tax receipt |
+| `nonprofit-generate-tax-receipt` | Generate tax receipt with deductible_amount (amount less goods-services fair value), goods-services value/description/provided flag and quid-pro-quo/250.00 acknowledgment statements; records no tax advice and no appraisal claim |
 | `nonprofit-list-tax-receipts` | List tax receipts |
 | `nonprofit-donor-summary` | Donor analytics summary |
 
@@ -76,7 +76,8 @@ python3 {baseDir}/scripts/db_query.py --action status
 | `nonprofit-fulfill-pledge` | Record pledge fulfillment |
 | `nonprofit-cancel-pledge` | Cancel pledge |
 
-### Funds (6 actions)
+### Funds (7 actions)
+Release from donor restriction (v1) uses the stored fund types `temporarily_restricted` for with-donor-restrictions and `unrestricted` for without-donor-restrictions.
 | Action | Description |
 |--------|-------------|
 | `nonprofit-add-fund` | Create fund |
@@ -85,8 +86,15 @@ python3 {baseDir}/scripts/db_query.py --action status
 | `nonprofit-list-funds` | List funds |
 | `nonprofit-add-fund-transfer` | Transfer between funds |
 | `nonprofit-approve-fund-transfer` | Approve fund transfer; refuses a permanently restricted source fund |
+| `nonprofit-release-restriction` | Release from donor restriction: move the released amount from a with-donor-restrictions fund (stored `temporarily_restricted`) to a without-donor-restrictions fund (stored `unrestricted`) as one completed transfer; needs --company-id, --from-fund-id, --to-fund-id, --amount with optional --transfer-date, --reason, --approved-by |
 
-### Grants (10 actions)
+### Endowments (1 action)
+Endowment appropriation (v1) records a board-approved appropriation of one explicit positive amount from an active permanently restricted endowment fund in the same company. It posts DR spendable fund balance / CR cash-or-investment under `journal_entry` in the same transaction, lowers the tracked endowment balance, refuses any overdraw, and is idempotent by endowment plus decision reference. It reports the remaining corpus and offers no legal prudence conclusion and no pool investment accounting.
+| Action | Description |
+|--------|-------------|
+| `nonprofit-appropriate-endowment` | Appropriate from an endowment fund: needs --company-id, --endowment-fund-id, --decision-date, exact positive --amount, --decision-reference, --cash-account-id (asset) and --spendable-account-id (equity); refuses overdraws, group/disabled or wrong-company accounts, and a reused decision reference with different details |
+
+### Grants (11 actions)
 | Action | Description |
 |--------|-------------|
 | `nonprofit-add-grant` | Create grant |
@@ -99,6 +107,7 @@ python3 {baseDir}/scripts/db_query.py --action status
 | `nonprofit-approve-grant-expense` | Approve grant expense (posts DR expense / CR cash; needs --expense-account-id, --cash-account-id and, for an expense account, --cost-center-id) |
 | `nonprofit-record-grant-receipt` | Record money received on an active or completed grant: posts DR cash / CR the credit account; needs --grant-id, --company-id, --amount, --receipt-date, --cash-account-id, --revenue-account-id (the account credited) and, for an income account, --cost-center-id; optional --reference; refused above the award less what is already received (a grant activated without --amount 0.00 has already recorded its award as received) |
 | `nonprofit-cancel-grant-receipt` | Cancel a grant receipt by --id: reverses its ledger rows and lowers the grant and fund by it; refused when approved expenses would exceed what remains received |
+| `nonprofit-classify-conditional-contribution` | Classify a conditional contribution on an active grant at one exact positive amount: needs --company-id, --grant-id, --receipt-date, --amount, --cash-account-id (asset), --revenue-account-id (income), --refundable-advance-account-id (liability), explicit --condition-text and --condition-met true/false (never inferred); condition met posts DR cash / CR contribution revenue, unmet posts DR cash / CR refundable advance; validates company scope and account types, refuses group/disabled accounts |
 | `nonprofit-reject-grant-expense` | Reject a draft grant expense (--id, optional --reason); no GL; unblocks close-grant |
 
 ### Volunteers (6 actions)
@@ -128,7 +137,7 @@ python3 {baseDir}/scripts/db_query.py --action status
 | `nonprofit-get-program` | Get program details |
 | `nonprofit-list-programs` | List programs |
 
-### Reports & Analytics (10 actions)
+### Reports & Analytics (11 actions)
 | Action | Description |
 |--------|-------------|
 | `nonprofit-donor-giving-history` | Donor giving history |
@@ -141,6 +150,7 @@ python3 {baseDir}/scripts/db_query.py --action status
 | `nonprofit-list-volunteer-shifts` | List volunteer shifts |
 | `nonprofit-update-program-outcomes` | Update program outcomes |
 | `nonprofit-fund-balance-reconcile` | Lists funds whose stored balance differs from their recorded donations, grant receipts, transfers and approved grant expenses; writes nothing |
+| `nonprofit-prepare-form-990` | Form 990 preparation worksheet (v1): read-only deterministic summary from recorded books for one company fiscal year; needs --company-id and --fiscal-year-id; reports exact Decimal totals with record counts, source availability and warnings; files nothing and offers no tax advice; review and filing remain outside ERPClaw |
 
 ## Technical Details (Tier 3)
-**Tables:** All use `nonprofitclaw_` prefix. **Script:** `scripts/db_query.py` routes to 7 modules. **Data:** Money=TEXT(Decimal), IDs=TEXT(UUID4). **Fund types:** unrestricted, temporarily_restricted, permanently_restricted, endowment.
+**Tables:** All use `nonprofitclaw_` prefix. **Script:** `scripts/db_query.py` routes to 8 modules. **Data:** Money=TEXT(Decimal), IDs=TEXT(UUID4). **Fund types:** unrestricted, temporarily_restricted, permanently_restricted, endowment.

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """NonprofitClaw compliance domain — 4 actions."""
+import json
 import os
 import sys
 import uuid
@@ -45,6 +46,38 @@ def _round(val):
     return val.quantize(Decimal("0.01"), ROUND_HALF_UP)
 
 
+QUID_PRO_QUO_THRESHOLD = Decimal("75.00")
+ACKNOWLEDGMENT_THRESHOLD = Decimal("250.00")
+
+
+def _substantiation(amount_dec, goods_fv_dec, goods_desc):
+    goods_fv = _round(goods_fv_dec)
+    deductible = _round(amount_dec - goods_fv)
+    provided = goods_fv > Decimal("0")
+    goods_fv_str = str(goods_fv)
+    amount_str = str(_round(amount_dec))
+    statements = []
+    if amount_dec > QUID_PRO_QUO_THRESHOLD and provided:
+        statements.append(
+            "Quid pro quo disclosure: goods or services with a fair value of "
+            + goods_fv_str + " were provided in exchange for this payment of "
+            + amount_str + "; only the excess of the payment over that value is deductible."
+        )
+    if amount_dec >= ACKNOWLEDGMENT_THRESHOLD:
+        if provided:
+            desc_part = " (" + str(goods_desc) + ")" if goods_desc else ""
+            statements.append(
+                "Acknowledgment: goods or services with a fair value of "
+                + goods_fv_str + desc_part
+                + " were provided in exchange for this donation."
+            )
+        else:
+            statements.append(
+                "Acknowledgment: no goods or services were provided in exchange for this donation."
+            )
+    return deductible, provided, statements
+
+
 # ------------------------------------------------------------------
 # Tax Receipts
 # ------------------------------------------------------------------
@@ -85,7 +118,8 @@ def generate_tax_receipt(conn, args):
 
         dq = (
             Q.from_(_don)
-            .select(_don.id, _don.amount, _don.donation_date, _don.tax_deductible, _don.status)
+            .select(_don.id, _don.amount, _don.donation_date, _don.tax_deductible, _don.status,
+                    _don.goods_services_fair_value, _don.goods_services_description)
             .where(_don.id == P())
             .where(_don.donor_id == P())
         )
@@ -135,7 +169,8 @@ def generate_tax_receipt(conn, args):
 
         qual_q = (
             Q.from_(_don)
-            .select(_don.id, _don.amount)
+            .select(_don.id, _don.amount, _don.goods_services_fair_value,
+                    _don.goods_services_description)
             .where(_don.donor_id == P())
             .where(_don.company_id == P())
             .where(_don.tax_deductible == 1)
@@ -162,20 +197,39 @@ def generate_tax_receipt(conn, args):
         total = sum((_dec(q["amount"]) for q in unreceipted), Decimal("0"))
         amount = str(_round(total))
         donation_id = None  # No single donation for annual summary
+        annual_goods_total = sum((_dec(q["goods_services_fair_value"]) for q in unreceipted), Decimal("0"))
+        annual_descs = sorted({str(q["goods_services_description"]) for q in unreceipted if q["goods_services_description"]})
+        annual_goods_desc = "; ".join(annual_descs) if annual_descs else None
     else:
         return err(f"Invalid receipt_type: {receipt_type}")
+
+    if receipt_type == "single":
+        amount_dec = _dec(donation["amount"])
+        goods_fv_dec = _dec(donation["goods_services_fair_value"])
+        goods_desc = donation["goods_services_description"]
+    else:
+        amount_dec = _dec(amount)
+        goods_fv_dec = _dec(annual_goods_total)
+        goods_desc = annual_goods_desc
+    deductible_dec, goods_provided, statements = _substantiation(amount_dec, goods_fv_dec, goods_desc)
+    deductible_amount = str(deductible_dec)
+    goods_fv_str = str(_round(goods_fv_dec))
 
     receipt_id = str(uuid.uuid4())
     naming = get_next_name(conn, "nonprofitclaw_tax_receipt", company_id=company_id)
 
     sql, _ = insert_row("nonprofitclaw_tax_receipt", {
         "id": P(), "naming_series": P(), "donor_id": P(), "donation_id": P(),
-        "receipt_date": P(), "amount": P(), "tax_year": P(), "receipt_type": P(),
+        "receipt_date": P(), "amount": P(), "deductible_amount": P(),
+        "goods_services_fair_value": P(), "goods_services_description": P(),
+        "statements": P(), "tax_year": P(), "receipt_type": P(),
         "sent_date": P(), "sent_method": P(), "company_id": P(),
     })
     conn.execute(sql, (
         receipt_id, naming, donor_id, donation_id,
-        str(date.today()), amount, tax_year, receipt_type,
+        str(date.today()), amount, deductible_amount,
+        goods_fv_str, goods_desc,
+        json.dumps(statements), tax_year, receipt_type,
         str(date.today()) if sent_method else None,
         sent_method, company_id,
     ))
@@ -194,6 +248,11 @@ def generate_tax_receipt(conn, args):
         "naming_series": naming,
         "donor_name": donor["name"],
         "amount": amount,
+        "deductible_amount": deductible_amount,
+        "goods_services_fair_value": goods_fv_str,
+        "goods_services_description": goods_desc,
+        "goods_services_provided": goods_provided,
+        "statements": statements,
         "tax_year": tax_year,
         "receipt_type": receipt_type,
     })
@@ -240,7 +299,9 @@ def list_tax_receipts(conn, args):
         .left_join(cust).on(de.customer_id == cust.id)
         .select(
             tr.id, tr.naming_series, tr.donor_id, cust.name.as_("donor_name"),
-            tr.donation_id, tr.receipt_date, tr.amount, tr.tax_year,
+            tr.donation_id, tr.receipt_date, tr.amount, tr.deductible_amount,
+            tr.goods_services_fair_value, tr.goods_services_description,
+            tr.statements, tr.tax_year,
             tr.receipt_type, tr.sent_date, tr.sent_method,
         )
     )
@@ -249,7 +310,26 @@ def list_tax_receipts(conn, args):
     data_q = data_q.orderby(tr.receipt_date, order=Order.desc).limit(P()).offset(P())
 
     rows = conn.execute(data_q.get_sql(), params + [limit, offset]).fetchall()
-    receipts = [dict(r) for r in rows]
+    receipts = []
+    for r in rows:
+        d = dict(r)
+        raw = d.get("statements")
+        try:
+            d["statements"] = json.loads(raw) if raw else []
+        except Exception:
+            d["statements"] = []
+        if d.get("goods_services_fair_value") is None:
+            d["goods_services_fair_value"] = "0.00"
+        if d.get("deductible_amount") is None:
+            try:
+                d["deductible_amount"] = str(_round(_dec(d.get("amount")) - _dec(d.get("goods_services_fair_value"))))
+            except Exception:
+                d["deductible_amount"] = d.get("amount")
+        try:
+            d["goods_services_provided"] = _dec(d.get("goods_services_fair_value")) > Decimal("0")
+        except Exception:
+            d["goods_services_provided"] = False
+        receipts.append(d)
     return ok({"tax_receipts": receipts, "total": total})
 
 

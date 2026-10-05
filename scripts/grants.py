@@ -34,6 +34,7 @@ _grant = Table("nonprofitclaw_grant")
 _ge = Table("nonprofitclaw_grant_expense")
 _fund = Table("nonprofitclaw_fund")
 _receipt = Table("nonprofitclaw_grant_receipt")
+_account = Table("account")
 
 
 def _dec(val):
@@ -881,6 +882,217 @@ def cancel_grant_receipt(conn, args):
     })
 
 
+
+
+def _account_refusal(row, account_id, company_id, expected_root, label):
+    if row is None:
+        return "%s account %s not found" % (label, account_id)
+    if row["company_id"] != company_id:
+        return "%s account %s does not belong to this company" % (label, account_id)
+    if row["is_group"]:
+        return "%s account '%s' is a group account: cannot post to group accounts" % (label, row["name"])
+    if row["disabled"]:
+        return "%s account '%s' is disabled" % (label, row["name"])
+    if row["root_type"] != expected_root:
+        return "%s account '%s' must be a %s account, currently '%s'" % (label, row["name"], expected_root, row["root_type"])
+    return None
+
+
+def classify_conditional_contribution(conn, args):
+    company_id = getattr(args, "company_id", None)
+    if not company_id:
+        return err("--company-id is required")
+    grant_id = getattr(args, "grant_id", None)
+    if not grant_id:
+        return err("--grant-id is required")
+
+    gq = Q.from_(_grant).select(_grant.star).where(_grant.id == P())
+    grant = conn.execute(gq.get_sql(), (grant_id,)).fetchone()
+    if not grant:
+        return err("Grant %s not found" % grant_id)
+    if grant["company_id"] != company_id:
+        return err("Grant does not belong to this company")
+    if grant["status"] not in ("active", "completed"):
+        return err("Grant must be 'active' or 'completed' to classify a conditional contribution, currently '%s'" % grant["status"])
+
+    amount_str = getattr(args, "amount", None)
+    if not amount_str:
+        return err("--amount is required")
+    try:
+        amount = _round(_dec(amount_str))
+    except Exception:
+        return err("Amount '%s' is not a valid Decimal" % amount_str)
+    if not amount.is_finite():
+        return err("Amount '%s' is not a valid Decimal" % amount_str)
+    if amount <= Decimal("0"):
+        return err("Amount must be positive")
+
+    receipt_date = getattr(args, "receipt_date", None)
+    if not receipt_date:
+        return err("--receipt-date is required")
+
+    cash_account_id = getattr(args, "cash_account_id", None)
+    revenue_account_id = getattr(args, "revenue_account_id", None)
+    advance_account_id = (
+        getattr(args, "refundable_advance_account_id", None)
+        or getattr(args, "advance_account_id", None)
+        or getattr(args, "refundable_account_id", None)
+        or getattr(args, "liability_account_id", None)
+    )
+    missing = []
+    if not cash_account_id:
+        missing.append("--cash-account-id")
+    if not revenue_account_id:
+        missing.append("--revenue-account-id")
+    if not advance_account_id:
+        missing.append("--refundable-advance-account-id")
+    if missing:
+        return err("Classifying a conditional contribution posts it to the ledger; missing: %s" % ", ".join(missing))
+
+    condition_text = (
+        getattr(args, "condition_text", None)
+        or getattr(args, "condition", None)
+        or getattr(args, "donor_condition", None)
+    )
+    if condition_text is None or str(condition_text).strip() == "":
+        return err("Explicit donor condition text is required (--condition-text); the condition must be supplied, never inferred")
+
+    raw_met = getattr(args, "condition_met", None)
+    if raw_met is None or (isinstance(raw_met, str) and raw_met.strip() == ""):
+        return err("Explicit --condition-met true/false is required; whether the condition was met must be supplied, never inferred")
+    if isinstance(raw_met, bool):
+        condition_met = raw_met
+    elif isinstance(raw_met, (int, float)):
+        if raw_met == 1:
+            condition_met = True
+        elif raw_met == 0:
+            condition_met = False
+        else:
+            return err("--condition-met must be true or false; whether the condition was met must be supplied, never inferred")
+    else:
+        text = str(raw_met).strip().lower()
+        if text in ("true", "t", "1", "yes", "y"):
+            condition_met = True
+        elif text in ("false", "f", "0", "no", "n"):
+            condition_met = False
+        else:
+            return err("--condition-met must be true or false; whether the condition was met must be supplied, never inferred")
+
+    if not HAS_GL:
+        return err("GL posting is not available; conditional contribution cannot be classified")
+
+    aq = Q.from_(_account).select(_account.star).where(_account.id == P())
+    cash_row = conn.execute(aq.get_sql(), (cash_account_id,)).fetchone()
+    revenue_row = conn.execute(aq.get_sql(), (revenue_account_id,)).fetchone()
+    advance_row = conn.execute(aq.get_sql(), (advance_account_id,)).fetchone()
+    for row, aid, expected, label in (
+        (cash_row, cash_account_id, "asset", "Cash"),
+        (revenue_row, revenue_account_id, "income", "Revenue"),
+        (advance_row, advance_account_id, "liability", "Refundable advance"),
+    ):
+        refusal = _account_refusal(row, aid, company_id, expected, label)
+        if refusal:
+            return err(refusal)
+
+    if condition_met:
+        classification = "contribution_revenue"
+        credit_account_id = revenue_account_id
+    else:
+        classification = "refundable_advance"
+        credit_account_id = advance_account_id
+
+    cost_center_id = getattr(args, "cost_center_id", None)
+    reference = getattr(args, "reference", None)
+    fund_id = grant["fund_id"]
+    amount_text = str(amount)
+    condition_text = str(condition_text).strip()
+    gl_entry_ids = None
+    try:
+        receipt_id = str(uuid.uuid4())
+        naming = get_next_name(conn, "nonprofitclaw_grant_receipt", company_id=company_id)
+        sql, _ = insert_row("nonprofitclaw_grant_receipt", {
+            "id": P(), "naming_series": P(), "grant_id": P(), "fund_id": P(),
+            "receipt_date": P(), "amount": P(), "reference": P(),
+            "cash_account_id": P(), "credit_account_id": P(),
+            "cost_center_id": P(), "status": P(), "company_id": P(),
+        })
+        conn.execute(sql, (
+            receipt_id, naming, grant_id, fund_id,
+            receipt_date, amount_text, reference,
+            cash_account_id, credit_account_id,
+            cost_center_id, "received", company_id,
+        ))
+
+        gl_entries = [
+            {
+                "account_id": cash_account_id,
+                "debit": amount_text,
+                "credit": "0",
+                "cost_center_id": cost_center_id,
+            },
+            {
+                "account_id": credit_account_id,
+                "debit": "0",
+                "credit": amount_text,
+                "cost_center_id": cost_center_id,
+            },
+        ]
+        try:
+            ids = insert_gl_entries(
+                conn,
+                gl_entries,
+                voucher_type="journal_entry",
+                voucher_id=receipt_id,
+                posting_date=receipt_date,
+                company_id=company_id,
+                remarks="Conditional contribution %s for grant %s (%s)" % (naming, grant_id, classification),
+            )
+            gl_entry_ids = json.dumps(ids)
+            sql_gl, params_gl = dynamic_update("nonprofitclaw_grant_receipt",
+                {"gl_entry_ids": gl_entry_ids}, where={"id": receipt_id})
+            conn.execute(sql_gl, params_gl)
+        except Exception as e:
+            conn.rollback()
+            err("GL posting failed for conditional contribution %s: %s" % (naming, e))
+
+        old_received_text = grant["received_amount"]
+        if old_received_text is None:
+            old_received_text = "0"
+        old_remaining_text = grant["remaining_amount"]
+        if old_remaining_text is None:
+            old_remaining_text = "0"
+        new_received = str(_round(_dec(old_received_text) + amount))
+        new_remaining = str(_round(_dec(new_received) - _dec(_exact_grant_spent(conn, grant_id))))
+        _guarded_grant_received(conn, grant_id, old_received_text, old_remaining_text, new_received, new_remaining)
+
+        if fund_id:
+            _shift_fund_balance(conn, fund_id, amount)
+
+        audit(conn, SKILL, "nonprofit-classify-conditional-contribution", "nonprofitclaw_grant_receipt", receipt_id,
+            new_values={"grant_id": grant_id, "amount": amount_text, "receipt_date": receipt_date,
+                        "classification": classification, "condition_met": condition_met,
+                        "condition_text": condition_text, "credit_account_id": credit_account_id})
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return err("Classifying conditional contribution failed: %s" % e)
+
+    return ok({
+        "id": receipt_id,
+        "receipt_id": receipt_id,
+        "naming_series": naming,
+        "grant_id": grant_id,
+        "amount": amount_text,
+        "classification": classification,
+        "condition_met": condition_met,
+        "condition_text": condition_text,
+        "credit_account_id": credit_account_id,
+        "gl_entry_ids": json.loads(gl_entry_ids),
+        "grant_received": new_received,
+        "grant_remaining": new_remaining,
+    })
+
+
 ACTIONS = {
     "nonprofit-add-grant": add_grant,
     "nonprofit-update-grant": update_grant,
@@ -895,4 +1107,5 @@ ACTIONS = {
     "nonprofit-close-grant": close_grant,
     "nonprofit-record-grant-receipt": record_grant_receipt,
     "nonprofit-cancel-grant-receipt": cancel_grant_receipt,
+    "nonprofit-classify-conditional-contribution": classify_conditional_contribution,
 }
